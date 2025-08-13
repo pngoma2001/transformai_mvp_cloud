@@ -1,0 +1,4 @@
+company,period,revenue,ebitda,gross_margin,active_customers,appointments,filled_appointments,churn_rate,avg_ticket,high_value_case_share,utilization
+HealthCo,2024Q4,74000000,7400000,0.34,82000,90000,77000,0.16,215.0,0.21,0.78
+HealthCo,2025Q1,75500000,7190000,0.33,83500,92000,78500,0.162,217.0,0.22,0.79
+HealthCo,2025Q2,76500000,7400000,0.335,84500,92500,79000,0.160,218.0,0.23,0.80
