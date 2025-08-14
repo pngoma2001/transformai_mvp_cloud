@@ -1,7 +1,6 @@
-
 import pandas as pd
 import numpy as np
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any
 
 def _level(score: float) -> str:
     if score is None: 
@@ -18,45 +17,31 @@ def _safe_mean(series):
         return None
 
 def pricing_power_index(survey: Optional[pd.DataFrame], market: Optional[pd.DataFrame], macro: Optional[pd.DataFrame]) -> Dict[str, Any]:
-    # Survey tolerance: wider acceptable range -> higher power
     tol_score = None
     if survey is not None and {"price_sensitivity_low","price_sensitivity_high"} <= set(survey.columns):
         low = _safe_mean(survey["price_sensitivity_low"])
         high = _safe_mean(survey["price_sensitivity_high"])
         if low is not None and high is not None and high > 0:
             width = max(high - low, 0)
-            tol_score = min(width / max(high*0.8, 1e-6), 1.0)  # normalized tolerance
-    # Market gap: if our_price < comp_price, room to lift
+            tol_score = min(width / max(high*0.8, 1e-6), 1.0)
     gap_score = None
     if market is not None and {"our_price","comp_price"} <= set(market.columns):
         diffs = (pd.to_numeric(market["comp_price"], errors="coerce") - pd.to_numeric(market["our_price"], errors="coerce")) / pd.to_numeric(market["our_price"], errors="coerce")
         diffs = diffs.replace([np.inf,-np.inf], np.nan).dropna()
         if len(diffs):
-            gap_score = float(np.clip(diffs.mean(), 0, 1))  # only positive gaps help
-    # Macro inflation boost (very rough): higher CPI -> more price acceptance
+            gap_score = float(np.clip(diffs.mean(), 0, 1))
     macro_boost = None
     if macro is not None and "value" in macro.columns:
         v = _safe_mean(macro["value"])
         if v is not None:
-            macro_boost = float(np.clip(v/100.0, 0, 0.2))  # cap small boost
-
-    # Weighted combination
-    parts = []
-    weights = []
+            macro_boost = float(np.clip(v/100.0, 0, 0.2))
+    parts = []; weights=[]
     if tol_score is not None: parts.append(tol_score); weights.append(0.5)
     if gap_score is not None: parts.append(gap_score); weights.append(0.35)
     if macro_boost is not None: parts.append(macro_boost); weights.append(0.15)
-    score = None
-    if parts:
-        score = float(np.clip(np.average(parts, weights=weights), 0, 1))
+    score = float(np.clip(np.average(parts, weights=weights), 0, 1)) if parts else None
     level = _level(score if score is not None else 0.5)
-
-    # Recommended price uplift default
-    reco = 0.06
-    if level == "low": reco = 0.03
-    elif level == "medium": reco = 0.06
-    else: reco = 0.09
-
+    reco = 0.09 if level == "high" else 0.06 if level == "medium" else 0.03
     notes = []
     if tol_score is not None: notes.append(f"Survey tolerance score ~ {tol_score:.2f}")
     if gap_score is not None: notes.append(f"Avg competitor gap ~ {gap_score*100:.1f}%")
@@ -64,7 +49,6 @@ def pricing_power_index(survey: Optional[pd.DataFrame], market: Optional[pd.Data
     return {"score": score, "level": level, "recommended_uplift": reco, "notes": notes}
 
 def churn_risk_index(survey: Optional[pd.DataFrame], kpi_churn: Optional[float]) -> Dict[str, Any]:
-    # Use detractor share + baseline churn
     detr_share = None
     if survey is not None and "nps" in survey.columns:
         s = pd.to_numeric(survey["nps"], errors="coerce").dropna()
@@ -72,21 +56,13 @@ def churn_risk_index(survey: Optional[pd.DataFrame], kpi_churn: Optional[float])
             detr_share = float((s < 7).mean())
     churn_norm = None
     if kpi_churn is not None:
-        churn_norm = float(np.clip(kpi_churn, 0, 0.4)) / 0.4  # normalize 0..0.4 to 0..1
-
+        churn_norm = float(np.clip(kpi_churn, 0, 0.4)) / 0.4
     parts = []; weights=[]
     if detr_share is not None: parts.append(detr_share); weights.append(0.6)
     if churn_norm is not None: parts.append(churn_norm); weights.append(0.4)
-    score=None
-    if parts:
-        score = float(np.clip(np.average(parts, weights=weights), 0, 1))
+    score = float(np.clip(np.average(parts, weights=weights), 0, 1)) if parts else None
     level = _level(score if score is not None else 0.5)
-
-    reco = 0.03
-    if level == "low": reco = 0.01
-    elif level == "medium": reco = 0.03
-    else: reco = 0.05
-
+    reco = 0.05 if level == "high" else 0.03 if level == "medium" else 0.01
     notes = []
     if detr_share is not None: notes.append(f"NPS detractors ~ {detr_share*100:.1f}%")
     if kpi_churn is not None: notes.append(f"Baseline churn ~ {kpi_churn*100:.1f}%")
@@ -99,20 +75,13 @@ def supply_stress_index(stockouts: Optional[pd.DataFrame]) -> Dict[str, Any]:
         if len(s): rate = float(s.mean())
     if stockouts is not None and "lead_time_days" in stockouts.columns:
         lt = pd.to_numeric(stockouts["lead_time_days"], errors="coerce").dropna()
-        if len(lt): vol = float(np.clip(lt.std()/max(lt.mean(),1e-6), 0, 2)/2)  # 0..1
+        if len(lt): vol = float(np.clip(lt.std()/max(lt.mean(),1e-6), 0, 2)/2)
     parts=[]; weights=[]
     if rate is not None: parts.append(rate); weights.append(0.7)
     if vol is not None: parts.append(vol); weights.append(0.3)
-    score=None
-    if parts:
-        score = float(np.clip(np.average(parts, weights=weights), 0, 1))
+    score = float(np.clip(np.average(parts, weights=weights), 0, 1)) if parts else None
     level = _level(score if score is not None else 0.5)
-
-    reco = 0.02
-    if level == "low": reco = 0.01
-    elif level == "medium": reco = 0.02
-    else: reco = 0.03
-
+    reco = 0.03 if level == "high" else 0.02 if level == "medium" else 0.01
     notes=[]
     if rate is not None: notes.append(f"Stockout rate ~ {rate*100:.1f}%")
     if vol is not None: notes.append(f"Lead time volatility score ~ {vol:.2f}")
@@ -129,23 +98,15 @@ def utilization_gap_index(util: Optional[pd.DataFrame]) -> Dict[str, Any]:
     ns=None
     if util is not None and "no_show_rate" in util.columns:
         ns = float(pd.to_numeric(util["no_show_rate"], errors="coerce").dropna().mean()) if len(util) else None
-
     parts=[]; weights=[]
     if gap is not None: parts.append(gap); weights.append(0.7)
     if ns is not None: parts.append(ns); weights.append(0.3)
-    score=None
-    if parts:
-        score = float(np.clip(np.average(parts, weights=weights), 0, 1))
+    score = float(np.clip(np.average(parts, weights=weights), 0, 1)) if parts else None
     level = _level(score if score is not None else 0.5)
-
-    reco = 0.02
-    if level == "low": reco = 0.01
-    elif level == "medium": reco = 0.02
-    else: reco = 0.03
-
+    reco = 0.03 if level == "high" else 0.02 if level == "medium" else 0.01
     notes=[]
     if gap is not None: notes.append(f"Average unused capacity ~ {gap*100:.1f}%")
-    if ns is not None: notes.append(f"No‑show rate ~ {ns*100:.1f}%")
+    if ns is not None: notes.append(f"No-show rate ~ {ns*100:.1f}%")
     return {"score": score, "level": level, "recommended_delta": reco, "notes": notes}
 
 def compute_evidence(signals_input: Dict[str, Optional[pd.DataFrame]], kpi_churn: Optional[float]) -> Dict[str, Any]:
@@ -154,21 +115,14 @@ def compute_evidence(signals_input: Dict[str, Optional[pd.DataFrame]], kpi_churn
     macro = signals_input.get("macro")
     stock = signals_input.get("stockouts")
     util = signals_input.get("utilization")
-
-    pricing = pricing_power_index(survey, market, macro)
-    churn = churn_risk_index(survey, kpi_churn)
-    supply = supply_stress_index(stock)
-    utilg = utilization_gap_index(util)
-
     return {
-        "pricing_power": pricing,
-        "churn_risk": churn,
-        "supply_stress": supply,
-        "utilization_gap": utilg
+        "pricing_power": pricing_power_index(survey, market, macro),
+        "churn_risk": churn_risk_index(survey, kpi_churn),
+        "supply_stress": supply_stress_index(stock),
+        "utilization_gap": utilization_gap_index(util)
     }
 
 def reorder_plays(plays: list, signals: Dict[str, Any]) -> list:
-    # Score plays by relevant signal
     weights = {
         "pricing": signals.get("pricing_power",{}).get("score",0.5) or 0.5,
         "retention": signals.get("churn_risk",{}).get("score",0.5) or 0.5,
