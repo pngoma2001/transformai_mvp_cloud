@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from engine import analyze, summarize_kpis  # your rule-based engine + KPI summary
+from engine import analyze, summarize_kpis  # rule-based engine + KPI summary
 
 # If keys are set in Streamlit Secrets, expose them to SDKs
 if "OPENAI_API_KEY" in st.secrets:
@@ -38,7 +38,7 @@ use_backend = bool(backend_url.strip())
 # ───────────────────────────── Header ───────────────────────────── #
 logo_path = Path(__file__).parent / "assets" / "logo.png"
 if logo_path.exists():
-    st.image(str(logo_path), width=260)
+    st.image(str(logo_path), width=260)           # safe: only loads if file exists
 st.title("Portfolio Company Analyzer")
 st.caption("AI playbooks for EBITDA growth & cost reduction")
 
@@ -55,7 +55,7 @@ sample = st.selectbox(
 uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
 
 with st.expander("Evidence Sources (optional)"):
-    st.markdown("Upload any of the following files to improve recommendations. Or tick samples.")
+    st.markdown("Upload any of the following files to improve recommendations, or tick samples.")
     colA, colB = st.columns(2)
     survey_file = colA.file_uploader("Customer survey (NPS & price sensitivity): customer_survey.csv",
                                      type=["csv"], key="survey_upl")
@@ -72,7 +72,7 @@ with st.expander("Evidence Sources (optional)"):
 # ───────────────────────── Analyze button ────────────────────────── #
 if st.button("Generate Playbook", type="primary"):
     # Load df
-    if uploaded:
+    if uploaded is not None:
         df = pd.read_csv(uploaded)
     else:
         if sample.startswith("RetailCo"):
@@ -85,19 +85,21 @@ if st.button("Generate Playbook", type="primary"):
         # Parse evidence files (CSV or sample)
         survey_df = pd.read_csv("data/sample_customer_survey.csv") if use_sample_evidence and survey_file is None else (pd.read_csv(survey_file) if survey_file else None)
         market_df = pd.read_csv("data/sample_market_prices.csv") if use_sample_evidence and market_file is None else (pd.read_csv(market_file) if market_file else None)
-        macro_df = pd.read_csv("data/sample_macro.csv") if use_sample_evidence and macro_file is None else (pd.read_csv(macro_file) if macro_file else None)
-        stock_df = pd.read_csv("data/sample_stockouts.csv") if use_sample_evidence and stockouts_file is None else (pd.read_csv(stockouts_file) if stockouts_file else None)
-        util_df = pd.read_csv("data/sample_utilization.csv") if use_sample_evidence and util_file is None else (pd.read_csv(util_file) if util_file else None)
+        macro_df  = pd.read_csv("data/sample_macro.csv")            if use_sample_evidence and macro_file  is None else (pd.read_csv(macro_file)  if macro_file  else None)
+        stock_df  = pd.read_csv("data/sample_stockouts.csv")        if use_sample_evidence and stockouts_file is None else (pd.read_csv(stockouts_file) if stockouts_file else None)
+        util_df   = pd.read_csv("data/sample_utilization.csv")      if use_sample_evidence and util_file is None else (pd.read_csv(util_file) if util_file else None)
 
         from evidence_utils import compute_evidence, reorder_plays
         try:
             kpi_churn = float(df.iloc[-1].get("churn_rate"))
         except Exception:
             kpi_churn = None
+
         evidence = compute_evidence(
             {"survey": survey_df, "market": market_df, "macro": macro_df, "stockouts": stock_df, "utilization": util_df},
             kpi_churn
         )
+        st.session_state["evidence"] = evidence  # <-- store for rendering & PDF
 
         # Branch: AI → Backend → Local rules
         if ai_mode:
@@ -105,10 +107,7 @@ if st.button("Generate Playbook", type="primary"):
             kpis = summarize_kpis(df)
             plays = None
             try:
-                if provider == "OpenAI":
-                    plays = call_openai(model_name, kpis, temperature)
-                else:
-                    plays = call_anthropic(model_name, kpis, temperature)
+                plays = call_openai(model_name, kpis, temperature) if provider == "OpenAI" else call_anthropic(model_name, kpis, temperature)
             except Exception:
                 plays = None
 
@@ -164,21 +163,23 @@ if "last_result" in st.session_state:
     if kpis.get("inventory_turns") is not None or kpis.get("utilization") is not None:
         col5.metric("🔄 Turns/Utilization", f"{kpis.get('inventory_turns') or kpis.get('utilization'):.2f}")
 
-    # Evidence summary chips
+    # Evidence summary chips (from session)
+    evidence = st.session_state.get("evidence", {})
     st.markdown("**Evidence Summary**")
+
     def _chip(label, level, notes):
-        color = {"low":"#F59E0B","medium":"#3B82F6","high":"#10B981","unknown":"#6B7280"}.get(level,"#6B7280")
-        html = f"<span style='display:inline-block;margin:0 8px 8px 0;padding:4px 8px;border-radius:999px;background:{color};color:white;font-size:12px;'>{label}: {level.title()}</span>"
+        color = {"low":"#F59E0B","medium":"#3B82F6","high":"#10B981","unknown":"#6B7280"}.get((level or "unknown"),"#6B7280")
+        html = f"<span style='display:inline-block;margin:0 8px 8px 0;padding:4px 8px;border-radius:999px;background:{color};color:white;font-size:12px;'>{label}: {str(level).title()}</span>"
         st.markdown(html, unsafe_allow_html=True)
         if notes:
-            with st.expander(f\"{label} details\"):
+            with st.expander(f"{label} details"):
                 for n in notes:
-                    st.markdown(f\"- {n}\")
+                    st.markdown(f"- {n}")
 
-    from evidence_utils import compute_evidence  # only to clarify attribute existence
-    evidence = st.session_state.get("evidence")  # will be None unless we stash; not critical
-    # Recompute quickly from kpis? We keep it simple: chips from last analysis variables not stored.
-    # To keep chips visible, we recompute minimal set using cached files would be overkill here.
+    _chip("Pricing power",  (evidence.get('pricing_power')  or {}).get('level', 'unknown'), (evidence.get('pricing_power')  or {}).get('notes', []))
+    _chip("Churn risk",     (evidence.get('churn_risk')     or {}).get('level', 'unknown'), (evidence.get('churn_risk')     or {}).get('notes', []))
+    _chip("Supply stress",  (evidence.get('supply_stress')  or {}).get('level', 'unknown'), (evidence.get('supply_stress')  or {}).get('notes', []))
+    _chip("Utilization gap",(evidence.get('utilization_gap')or {}).get('level', 'unknown'), (evidence.get('utilization_gap')or {}).get('notes', []))
 
     # Trend chart (if multi-period)
     try:
@@ -209,27 +210,17 @@ if "last_result" in st.session_state:
     if "decisions" not in st.session_state:
         st.session_state.decisions = {}
 
-    # We’ll recreate evidence quickly for slider defaults (based on last run’s inputs)
-    def _last_evidence():
-        try:
-            # Best-effort small recompute using sample flags; if none, use neutral values.
-            from evidence_utils import compute_evidence
-            # Neutral minimal structure:
-            return {
-                "pricing_power": {"recommended_uplift": 0.06, "level": "medium", "notes": []},
-                "churn_risk": {"recommended_reduction": 0.03, "level": "medium", "notes": []},
-                "supply_stress": {"recommended_delta": 0.02, "level": "medium", "notes": []},
-                "utilization_gap": {"recommended_delta": 0.02, "level": "medium", "notes": []},
-            }
-        except Exception:
-            return {
-                "pricing_power": {"recommended_uplift": 0.06, "level": "medium", "notes": []},
-                "churn_risk": {"recommended_reduction": 0.03, "level": "medium", "notes": []},
-                "supply_stress": {"recommended_delta": 0.02, "level": "medium", "notes": []},
-                "utilization_gap": {"recommended_delta": 0.02, "level": "medium", "notes": []},
-            }
+    # Evidence-based default values (fall back to neutral if no evidence)
+    ev = {
+        "pricing_power":  {"recommended_uplift": 0.06, "level": "medium"},
+        "churn_risk":     {"recommended_reduction": 0.03, "level": "medium"},
+        "supply_stress":  {"recommended_delta": 0.02, "level": "medium"},
+        "utilization_gap":{"recommended_delta": 0.02, "level": "medium"},
+    }
+    for k in ev.keys():
+        ev[k].update((evidence.get(k) or {}))
 
-    ev = _last_evidence()
+    from evidence_utils import reorder_plays  # already used earlier
 
     for play in data["plays"]:
         with st.container(border=True):
@@ -250,7 +241,7 @@ if "last_result" in st.session_state:
 
                 # ROI sliders with evidence-based defaults
                 if play.get("type") == "pricing":
-                    default_pct = float(ev["pricing_power"]["recommended_uplift"])
+                    default_pct = float(ev["pricing_power"].get("recommended_uplift", 0.06))
                     pct = st.slider("Assumed price increase", 0.0, 0.12, default_pct, 0.01, key=f"slider_{play['id']}")
                     gm = st.slider("Gross margin", 0.1, 0.7, float(kpis.get('gross_margin', 0.35)), 0.01, key=f"gm_{play['id']}")
                     adoption = st.slider("Adoption", 0.1, 1.0, 0.6, 0.05, key=f"adopt_{play['id']}")
@@ -258,14 +249,17 @@ if "last_result" in st.session_state:
                     if ev["pricing_power"].get("level") == "low":
                         st.warning("Evidence suggests high price sensitivity. Consider capping uplift at 3%.")
                 elif play.get("type") == "retention":
-                    default_rr = float(ev["churn_risk"]["recommended_reduction"])
+                    default_rr = float(ev["churn_risk"].get("recommended_reduction", 0.03))
                     reduce_pp = st.slider("Churn reduction (pp)", 0.00, 0.10, default_rr, 0.005, key=f"slider_{play['id']}")
                     gm = st.slider("Gross margin", 0.1, 0.7, float(kpis.get('gross_margin', 0.35)), 0.01, key=f"gm_{play['id']}")
                     uplift = kpis["revenue"] * reduce_pp * gm * 0.5
                     if ev["churn_risk"].get("level") == "high":
                         st.info("High churn risk detected — prioritize retention campaigns and journey fixes.")
                 elif play.get("type") in ["supply", "utilization"]:
-                    default_delta = float(ev["supply_stress"]["recommended_delta"] if play["type"]=="supply" else ev["utilization_gap"]["recommended_delta"])
+                    default_delta = float(
+                        ev["supply_stress"].get("recommended_delta", 0.02) if play["type"]=="supply"
+                        else ev["utilization_gap"].get("recommended_delta", 0.02)
+                    )
                     delta = st.slider("Impact factor", 0.00, 0.05, default_delta, 0.005, key=f"slider_{play['id']}")
                     gm = st.slider("Gross margin", 0.1, 0.7, float(kpis.get('gross_margin', 0.35)), 0.01, key=f"gm_{play['id']}")
                     uplift = kpis["revenue"] * delta * gm
@@ -365,13 +359,12 @@ if "last_result" in st.session_state:
     else:
         st.dataframe(pd.DataFrame(st.session_state.activity))
 
-    # Export PDF
+    # Export PDF (now passes evidence for appendix)
     if st.button("Export Summary PDF"):
         from pdf_utils import export_summary_pdf
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            # evidence isn't persisted in session here; export without it is still fine.
-            export_summary_pdf(tmp.name, kpis.get("company"), kpis, st.session_state.decisions)
+            export_summary_pdf(tmp.name, kpis.get("company"), kpis, st.session_state.decisions, evidence=st.session_state.get("evidence"))
             tmp.flush()
             st.download_button(
                 "Download PDF",
