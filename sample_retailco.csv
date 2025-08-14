@@ -1,4 +1,0 @@
-company,period,revenue,ebitda,gross_margin,active_customers,logo_orders,repeat_orders,churn_rate,avg_sku_price,high_demand_sku_share,inventory_turns
-RetailCo,2024Q4,52000000,5200000,0.38,120000,48000,24000,0.21,18.5,0.27,7.2
-RetailCo,2025Q1,54000000,4860000,0.36,123500,49500,24650,0.205,18.9,0.28,7.0
-RetailCo,2025Q2,55500000,4995000,0.365,125000,50000,25000,0.202,19.1,0.29,6.9
