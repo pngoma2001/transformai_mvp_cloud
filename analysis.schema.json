@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "kpis",
+    "plays"
+  ],
+  "properties": {
+    "kpis": {
+      "type": "object",
+      "required": [
+        "company",
+        "period",
+        "revenue",
+        "ebitda",
+        "gross_margin"
+      ],
+      "properties": {
+        "company": {
+          "type": "string"
+        },
+        "period": {
+          "type": "string"
+        },
+        "revenue": {
+          "type": "number"
+        },
+        "revenue_yoy": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ebitda": {
+          "type": "number"
+        },
+        "ebitda_margin": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "gross_margin": {
+          "type": "number"
+        },
+        "churn_rate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "inventory_turns": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "utilization": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "plays": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "title",
+          "hypothesis",
+          "uplift_usd",
+          "uplift_pct",
+          "confidence",
+          "complexity",
+          "assumptions",
+          "risks",
+          "plan"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "pricing",
+              "retention",
+              "supply",
+              "utilization",
+              "claims",
+              "referrals"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "hypothesis": {
+            "type": "string"
+          },
+          "uplift_usd": {
+            "type": "number"
+          },
+          "uplift_pct": {
+            "type": "number"
+          },
+          "confidence": {
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "complexity": {
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "assumptions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "risks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "plan": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "week",
+                "step",
+                "owner_role"
+              ],
+              "properties": {
+                "week": {
+                  "type": "integer"
+                },
+                "step": {
+                  "type": "string"
+                },
+                "owner_role": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
