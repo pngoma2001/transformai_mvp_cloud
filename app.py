@@ -1,12 +1,8 @@
-# app.py — TransformAI (Streamlit cloud-safe, KPI fixes)
+# app.py — TransformAI (Streamlit cloud-safe, loads samples from /data)
 from __future__ import annotations
 
-import io
 from pathlib import Path
-from datetime import datetime
-import json
 import time
-
 import pandas as pd
 import streamlit as st
 
@@ -46,32 +42,53 @@ creativity = st.sidebar.slider("Creativity", 0.0, 1.0, 0.2, 0.01,
                                disabled=not use_ai)
 backend_url = st.sidebar.text_input("Backend URL (optional)")
 
-# ───────────────────────────── Sample data helpers ────────────────────
-def make_sample_df(kind: str) -> pd.DataFrame:
-    """Return 8 quarters of made-up KPIs for a sample company."""
-    periods = pd.period_range("2023Q1", "2024Q4", freq="Q")
-    df = pd.DataFrame({"period": periods.astype(str)})
-    if kind == "RetailCo":
-        df["revenue"] = [41.4, 43.0, 44.5, 45.9, 49.5, 50.2, 52.0, 56.3]
-        df["ebitda"]  = [ 9.5, 10.0, 10.2, 10.4, 10.8, 11.0, 11.5, 12.0]
-        df["gross_margin"] = [34.0, 34.8, 35.2, 35.7, 36.1, 36.5, 36.9, 37.0]  # %
-        df["churn_rate"]   = [21.0, 21.2, 21.0, 20.9, 20.8, 20.7, 20.6, 20.6]  # %
-        df["turns_util"]   = [6.8,  6.9,  7.0,  7.1,  7.2,  7.2,  7.3,  7.45]
-    else:  # HealthCo
-        df["revenue"] = [28.2, 28.8, 29.1, 29.9, 31.2, 31.7, 32.4, 33.0]
-        df["ebitda"]  = [ 5.1,  5.2,  5.3,  5.4,  5.6,  5.7,  5.8,  6.0]
-        df["gross_margin"] = [38.0, 38.1, 38.2, 38.4, 38.6, 38.7, 38.8, 39.0]  # %
-        df["churn_rate"]   = [12.0, 12.1, 12.2, 12.3, 12.3, 12.2, 12.1, 12.0]  # %
-        df["turns_util"]   = [4.8,  4.9,  5.0,  5.1,  5.1,  5.2,  5.2,  5.3]
-    return df
-
-SAMPLES = {
-    "RetailCo": make_sample_df("RetailCo"),
-    "HealthCo": make_sample_df("HealthCo"),
+# ───────────────────────────── Data loading helpers ───────────────────
+SAMPLE_MAP = {
+    "RetailCo": ("data/sample_retailco.csv", "RetailCo"),
+    "RetailCo (8q)": ("data/sample_retailco_long.csv", "RetailCo"),
+    "HealthCo": ("data/sample_healthco.csv", "HealthCo"),
+    "HealthCo (8q)": ("data/sample_healthco_long.csv", "HealthCo"),
 }
 
-def read_csv(file) -> pd.DataFrame:
-    return pd.read_csv(file)
+def load_sample(label: str) -> pd.DataFrame:
+    """Load a sample CSV from /data, with a safe fallback to an empty frame."""
+    path, company = SAMPLE_MAP[label]
+    p = Path(path)
+    if p.exists():
+        df = pd.read_csv(p)
+        # ensure a 'period' column exists for charts (many samples already have it)
+        if "period" not in df.columns:
+            df["period"] = range(1, len(df) + 1)
+        st.session_state["company_name"] = company
+        return df
+    # Fallback: empty frame (will trigger friendly error later)
+    st.warning(f"Sample file not found: {p}. Using an empty dataset.")
+    st.session_state["company_name"] = company
+    return pd.DataFrame(columns=["period", "revenue", "ebitda"])
+
+def normalize_kpis(df: pd.DataFrame) -> pd.DataFrame:
+    """Fix missing/variant columns and units so tiles display correctly."""
+    out = df.copy()
+    # Derive gross_margin if missing (as %)
+    if "gross_margin" not in out.columns and {"revenue", "ebitda"} <= set(out.columns):
+        out["gross_margin"] = (
+            pd.to_numeric(out["ebitda"], errors="coerce") /
+            pd.to_numeric(out["revenue"], errors="coerce")
+        ) * 100.0
+    # If gross_margin looks like a fraction (<=1), convert to %
+    if "gross_margin" in out.columns and pd.to_numeric(out["gross_margin"], errors="coerce").max() <= 1.0:
+        out["gross_margin"] = pd.to_numeric(out["gross_margin"], errors="coerce") * 100.0
+    # Map inventory_turns → turns_util
+    if "turns_util" not in out.columns and "inventory_turns" in out.columns:
+        out["turns_util"] = pd.to_numeric(out["inventory_turns"], errors="coerce")
+    # Ensure churn stays as % (convert fraction → %)
+    if "churn_rate" in out.columns:
+        ch = pd.to_numeric(out["churn_rate"], errors="coerce")
+        if ch.max() <= 1.0:
+            out["churn_rate"] = ch * 100.0
+        else:
+            out["churn_rate"] = ch
+    return out
 
 def has_multi_periods(df: pd.DataFrame) -> bool:
     return "period" in df.columns and df["period"].nunique() > 1
@@ -82,7 +99,7 @@ st.markdown(
     "estimated EBITDA uplift."
 )
 
-sample = st.selectbox("Choose a sample company", list(SAMPLES.keys()))
+sample = st.selectbox("Choose a sample company", list(SAMPLE_MAP.keys()), index=1)
 uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
 
 with st.expander("Evidence Sources (optional)"):
@@ -93,80 +110,45 @@ with st.expander("Evidence Sources (optional)"):
 
 # Resolve primary dataframe
 if uploaded is not None:
-    df = read_csv(uploaded)
+    df = pd.read_csv(uploaded)
     st.session_state["company_name"] = Path(uploaded.name).stem.title()
 else:
-    df = SAMPLES[sample].copy()
-    st.session_state["company_name"] = sample
+    df = load_sample(sample)
 
-# 🔧 DERIVED COLUMNS/FALLBACKS (fixes wrong % and 0.00 turns)
-# - If gross_margin is missing, compute as ebitda/revenue (fraction).
-# - If churn_rate provided as fraction, keep as fraction and multiply at display time.
-# - If turns_util missing but inventory_turns exists, map it.
-if "gross_margin" not in df.columns and {"revenue", "ebitda"} <= set(df.columns):
-    df["gross_margin"] = (pd.to_numeric(df["ebitda"], errors="coerce") /
-                          pd.to_numeric(df["revenue"], errors="coerce")).fillna(0.0) * 100.0  # percentage
-# Normalize: if gross_margin looks like a fraction (e.g., 0.37), convert to %
-if df["gross_margin"].max() <= 1.0:
-    df["gross_margin"] = df["gross_margin"] * 100.0
+df = normalize_kpis(df)
 
-if "turns_util" not in df.columns and "inventory_turns" in df.columns:
-    df["turns_util"] = pd.to_numeric(df["inventory_turns"], errors="coerce").fillna(0.0)
-
-# Optional evidence — safely read (kept minimal for now)
-survey_df = None
-market_df = None
-if survey_file is not None:
-    survey_df = read_csv(survey_file)
-elif use_sample_evidence:
-    p = Path("data/sample_customer_survey.csv")
-    if p.exists():
-        survey_df = pd.read_csv(p)
-
-if market_file is not None:
-    market_df = read_csv(market_file)
-elif use_sample_evidence:
-    p = Path("data/sample_market.csv")
-    if p.exists():
-        market_df = pd.read_csv(p)
-
-# ───────────────────────────── Actions ────────────────────────────────
+# ───────────────────────────── Action ────────────────────────────────
 st.divider()
 if st.button("Generate Playbook", type="primary"):
-    # Compute KPIs snapshot and stash
-    last = df.iloc[-1]
-    kpis = {
-        "company": st.session_state.get("company_name", "UnknownCo"),
-        "period": last.get("period", "Latest"),
-        "revenue": float(last.get("revenue", 0.0)),
-        "ebitda": float(last.get("ebitda", 0.0)),
-        # keep as PERCENT number (e.g., 37.0)
-        "gross_margin": float(last.get("gross_margin", 0.0)),
-        # keep churn as PERCENT if it looks like percent; if fraction, convert
-        "churn_rate": float(last.get("churn_rate", 0.0)),
-        "turns_util": float(last.get("turns_util", 0.0)),
-    }
-    # YoY %
-    if has_multi_periods(df) and len(df) >= 5:
-        kpis["revenue_yoy"] = float(
-            (df["revenue"].iloc[-1] - df["revenue"].iloc[-5]) /
-            max(df["revenue"].iloc[-5], 1e-9) * 100.0
-        )
+    if len(df) == 0 or {"revenue", "ebitda"} - set(df.columns):
+        st.error("Your dataset should include at least 'revenue' and 'ebitda' columns.")
     else:
-        kpis["revenue_yoy"] = None
+        last = df.iloc[-1]
+        kpis = {
+            "company": st.session_state.get("company_name", "UnknownCo"),
+            "period": last.get("period", "Latest"),
+            "revenue": float(last.get("revenue", 0.0)),
+            "ebitda": float(last.get("ebitda", 0.0)),
+            "gross_margin": float(last.get("gross_margin", 0.0)),   # already %
+            "churn_rate": float(last.get("churn_rate", 0.0)),       # already %
+            "turns_util": float(last.get("turns_util", 0.0)),
+        }
+        # YoY % if we have at least 5 periods
+        if has_multi_periods(df) and len(df) >= 5:
+            kpis["revenue_yoy"] = float(
+                (df["revenue"].iloc[-1] - df["revenue"].iloc[-5]) /
+                max(df["revenue"].iloc[-5], 1e-9) * 100.0
+            )
+        else:
+            kpis["revenue_yoy"] = None
 
-    # Normalize churn to percent for display
-    if kpis["churn_rate"] <= 1.0:
-        kpis["churn_rate"] *= 100.0
+        st.session_state["kpis"] = kpis
+        st.session_state.setdefault("decisions", [])
+        st.session_state.setdefault("activity", [])
 
-    st.session_state["kpis"] = kpis
-    st.session_state.setdefault("decisions", [])
-    st.session_state.setdefault("activity", [])
-
-# When we have KPIs, render the summary and plays
+# ───────────────────────────── Render results ────────────────────────
 kpis = st.session_state.get("kpis")
 if kpis:
-    # Summary
     st.subheader(f"Summary — {kpis['company']} ({kpis.get('period', 'Latest')})")
 
     cols = st.columns(5)
@@ -185,58 +167,50 @@ if kpis:
         trend = df[["period", "revenue", "ebitda"]].copy().set_index("period")
         st.line_chart(trend)
 
-    # Simple plays (non-LLM)
-    def simple_playbook(df: pd.DataFrame, k: dict) -> list[dict]:
-        plays = []
-        plays.append({
-            "id": "pricing",
-            "title": "Pricing Optimization",
-            "confidence": "High",
-            "complexity": "Medium",
-            "assumed_increase": 0.06,
-            "rationale": "Top 30% SKUs show low elasticity; raise prices 5–7% with guardrails.",
-            "uplift_estimate": round(k["revenue"] * 0.06 * 0.3 * 0.3, 2),
-        })
-        plays.append({
-            "id": "retention",
-            "title": "Customer Retention Program",
-            "confidence": "Medium",
-            "complexity": "Medium",
-            "assumed_decrease": 0.02,
-            "rationale": "Lifecycle messaging & loyalty offers to reduce churn by ~2%.",
-            "uplift_estimate": round(k["revenue"] * 0.02 * 0.4, 2),
-        })
-        plays.append({
-            "id": "utilization",
-            "title": "Inventory & Utilization Tuning",
-            "confidence": "Medium",
-            "complexity": "Low",
-            "rationale": "Tune reorder points and slotting; improve turns/utilization.",
-            "uplift_estimate": round(k["revenue"] * 0.01, 2),
-        })
-        return plays
+    # Simple demo plays (non-LLM)
+    def simple_playbook(k: dict) -> list[dict]:
+        return [
+            {
+                "id": "pricing",
+                "title": "Pricing Optimization",
+                "confidence": "High",
+                "complexity": "Medium",
+                "assumed_increase": 0.06,
+                "rationale": "Top 30% SKUs show low elasticity; raise prices 5–7% with guardrails.",
+                "uplift_estimate": round(k["revenue"] * 0.06 * 0.3 * 0.3, 2),
+            },
+            {
+                "id": "retention",
+                "title": "Customer Retention Program",
+                "confidence": "Medium",
+                "complexity": "Medium",
+                "assumed_decrease": 0.02,
+                "rationale": "Lifecycle messaging & loyalty offers to reduce churn by ~2%.",
+                "uplift_estimate": round(k["revenue"] * 0.02 * 0.4, 2),
+            },
+            {
+                "id": "utilization",
+                "title": "Inventory & Utilization Tuning",
+                "confidence": "Medium",
+                "complexity": "Low",
+                "rationale": "Tune reorder points and slotting; improve turns/utilization.",
+                "uplift_estimate": round(k["revenue"] * 0.01, 2),
+            },
+        ]
 
     st.subheader("Recommended Plays")
-    plays = simple_playbook(df, kpis)
-
-    for play in plays:
+    for play in simple_playbook(kpis):
         with st.container(border=True):
             st.markdown(f"**{play['title']}**")
             st.caption(f"Confidence: {play['confidence']} • Complexity: {play['complexity']}")
             st.write(play["rationale"])
 
             if "assumed_increase" in play:
-                st.slider(
-                    "Assumed price increase",
-                    min_value=0.00, max_value=0.12, value=play["assumed_increase"],
-                    step=0.01, key=f"inc_{play['id']}",
-                )
+                st.slider("Assumed price increase", 0.00, 0.12, play["assumed_increase"], 0.01, key=f"inc_{play['id']}")
 
             st.write(f"Estimated revenue impact (very rough): **${play['uplift_estimate']:,.0f}**")
 
-            # Decision radio
-            decision = st.radio("Decision", ["Pending", "Approved", "Rejected"],
-                                horizontal=True, key=f"dec_{play['id']}")
+            decision = st.radio("Decision", ["Pending", "Approved", "Rejected"], horizontal=True, key=f"dec_{play['id']}")
             rationale = st.text_input("Rationale (optional)", key=f"rat_{play['id']}")
             if st.button("Save decision", key=f"save_{play['id']}"):
                 st.session_state["decisions"].append({
@@ -244,7 +218,7 @@ if kpis:
                     "title": play["title"],
                     "decision": decision.lower(),
                     "rationale": rationale,
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 })
                 st.success("Saved.")
 
@@ -259,14 +233,12 @@ if kpis:
                 })
                 st.success("Integration job queued → success")
 
-    # Activity
     st.subheader("Activity Log")
     if len(st.session_state.get("activity", [])) == 0:
         st.info("No activity yet.")
     else:
         st.dataframe(pd.DataFrame(st.session_state["activity"]))
 
-    # Export PDF (optional)
     if st.button("Export Summary PDF"):
         try:
             from pdf_utils import export_summary_pdf
