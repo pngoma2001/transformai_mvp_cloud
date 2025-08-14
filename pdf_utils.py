@@ -1,4 +1,3 @@
-
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
@@ -8,7 +7,7 @@ def export_summary_pdf(path, company, kpis, decisions, logo_path="assets/logo.pn
     c = canvas.Canvas(path, pagesize=LETTER)
     width, height = LETTER
 
-    # Header
+    # Header with logo + brand color
     try:
         c.drawImage(logo_path, 1*inch, height-0.9*inch, width=1.8*inch, preserveAspectRatio=True, mask="auto")
     except Exception:
@@ -17,7 +16,8 @@ def export_summary_pdf(path, company, kpis, decisions, logo_path="assets/logo.pn
     c.setFont("Helvetica-Bold", 16)
     c.drawString(1*inch, height-1.05*inch, f"TransformAI Summary — {company}")
     c.setFont("Helvetica", 10)
-    c.drawString(1*inch, height-1.2*inch, f"Period: {kpis.get('period','')}")
+    c.setFillColor(colors.black)
+    c.drawString(1*inch, height-1.25*inch, f"Period: {kpis.get('period','')}")
 
     # KPIs
     y = height - 1.6*inch
