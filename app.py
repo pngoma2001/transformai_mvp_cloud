@@ -1,4 +1,4 @@
-# app.py — TransformAI (Cloud) with evidence chips fix
+# app.py — TransformAI (Cloud) with backend API key + evidence chips
 
 import os, time, json
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import requests  # ← P3: backend calls
 
 from engine import analyze, summarize_kpis
 from evidence_utils import (
@@ -13,7 +14,7 @@ from evidence_utils import (
     rank_plays_by_evidence, chips_from_signals
 )
 
-# Map Streamlit secrets to env vars (optional for SDKs)
+# Optional: map Streamlit secrets to env vars (for AI providers)
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 if "ANTHROPIC_API_KEY" in st.secrets:
@@ -37,11 +38,29 @@ default_model = "gpt-4o-mini" if provider == "OpenAI" else "claude-3-5-sonnet-20
 model_name = st.sidebar.text_input("Model name", value=default_model, disabled=not ai_mode)
 temperature = st.sidebar.slider("Creativity", 0.0, 1.0, 0.2, 0.05, disabled=not ai_mode)
 
-# Optional backend URL (if you run FastAPI)
-backend_url = st.sidebar.text_input("Backend URL (optional)", value="")
+# ───────────────── Backend wiring (P3) ─────────────────
+backend_url = st.sidebar.text_input("Backend URL (optional)", value="", placeholder="https://your-api.example.com")
+api_key = st.sidebar.text_input("Backend API Key", type="password", value="")
 use_backend = bool(backend_url.strip())
+headers = {"x-api-key": api_key} if api_key else {}
 
-# ───────────────── Header / Hero ────────────────
+def _burl(path: str) -> str:
+    return f"{backend_url.rstrip('/')}{path}"
+
+# Quick health check button
+if use_backend and st.sidebar.button("Test backend connection"):
+    try:
+        r = requests.get(_burl("/health"), headers=headers, timeout=10)
+        if r.status_code == 200 and r.json().get("ok"):
+            st.sidebar.success("Backend OK")
+        elif r.status_code == 401:
+            st.sidebar.error("Unauthorized: API key missing/invalid.")
+        else:
+            st.sidebar.error(f"Backend error: {r.status_code}")
+    except Exception as e:
+        st.sidebar.error(f"Cannot reach backend: {e}")
+
+# ───────────────── Header / Hero ─────────────────
 logo_path = Path("assets/logo.png")
 if logo_path.exists():
     st.image(str(logo_path), width=220)
@@ -56,7 +75,7 @@ st.markdown(
     "with estimated EBITDA uplift."
 )
 
-# ───────────────── Data selection ───────────────
+# ───────────────── Data selection ─────────────────
 sample = st.selectbox(
     "Choose a sample company",
     ["RetailCo", "RetailCo (8q)", "HealthCo", "HealthCo (8q)"]
@@ -73,7 +92,7 @@ with st.expander("Evidence Sources (optional)"):
     stockouts_file = st.file_uploader("Stockouts (CSV)", type=["csv"], key="stockouts_csv")
     util_file      = st.file_uploader("Utilization (CSV)", type=["csv"], key="util_csv")
 
-# ───────────────── Analyze ──────────────────────
+# ───────────────── Analyze ─────────────────
 if st.button("Generate Playbook", type="primary"):
     # Load main dataset
     if uploaded:
@@ -90,11 +109,8 @@ if st.button("Generate Playbook", type="primary"):
     if any([survey_file, market_file, macro_file, stockouts_file, util_file]) or use_sample_ev:
         ev = load_sample_evidence(
             use_sample_ev=use_sample_ev,
-            survey_file=survey_file,
-            market_file=market_file,
-            macro_file=macro_file,
-            stockouts_file=stockouts_file,
-            util_file=util_file,
+            survey_file=survey_file, market_file=market_file,
+            macro_file=macro_file, stockouts_file=stockouts_file, util_file=util_file
         )
 
     # Analyze (AI → backend → local rules)
@@ -108,7 +124,6 @@ if st.button("Generate Playbook", type="primary"):
                 plays = (call_openai if provider == "OpenAI" else call_anthropic)(model_name, kpis, temperature)
             except Exception:
                 plays = None
-
             if not plays:
                 result = analyze(df)
             else:
@@ -119,18 +134,29 @@ if st.button("Generate Playbook", type="primary"):
                     result = candidate
                 except Exception:
                     result = analyze(df)
+
         elif use_backend:
-            import requests
-            r = requests.post(
-                f"{backend_url.rstrip('/')}/analyze",
-                files={"file": ("data.csv", df.to_csv(index=False), "text/csv")},
-            )
-            resp = r.json()
-            if resp.get("ok"):
-                result = resp["result"]
-            else:
-                st.error(resp.get("error", "Backend error"))
+            try:
+                # We send the dataframe we just loaded (upload or sample) as a CSV file
+                r = requests.post(
+                    _burl("/analyze"),
+                    headers=headers,
+                    files={"file": ("data.csv", df.to_csv(index=False), "text/csv")},
+                    timeout=60,
+                )
+                if r.status_code == 401:
+                    st.error("Backend unauthorized: please enter a valid API Key in the sidebar.")
+                    st.stop()
+                r.raise_for_status()
+                resp = r.json()
+                if resp.get("ok"):
+                    result = resp["result"]
+                else:
+                    st.error(resp.get("error", "Backend error")); st.stop()
+            except Exception as e:
+                st.error(f"Backend call failed: {e}")
                 st.stop()
+
         else:
             result = analyze(df)
 
@@ -146,14 +172,13 @@ if st.button("Generate Playbook", type="primary"):
         # Fetch backend activity (optional)
         if use_backend:
             try:
-                import requests
-                act = requests.get(f"{backend_url.rstrip('/')}/activity").json()
+                act = requests.get(_burl("/activity"), headers=headers, timeout=20).json()
                 if isinstance(act, list):
                     st.session_state.activity = act
             except Exception:
                 pass
 
-# ───────────────── Render ───────────────────────
+# ───────────────── Render ─────────────────
 if "last_result" in st.session_state:
     data = st.session_state.last_result
     kpis = data["kpis"]
@@ -169,7 +194,7 @@ if "last_result" in st.session_state:
     if kpis.get("inventory_turns") is not None or kpis.get("utilization") is not None:
         col5.metric("🔄 Turns/Utilization", f"{kpis.get('inventory_turns') or kpis.get('utilization'):.2f}")
 
-    # Optional trend chart when multiple periods exist
+    # Trend chart if multiple periods
     try:
         if uploaded is not None:
             df_plot = pd.read_csv(uploaded)
@@ -187,11 +212,11 @@ if "last_result" in st.session_state:
     except Exception:
         pass
 
-    # ───────── Evidence (bug fix: render chips as HTML)
+    # Evidence chips (render HTML badges)
     st.markdown("### Evidence")
-    chips = chips_from_signals(signals)  # returns <span> badges from evidence_utils.py  :contentReference[oaicite:1]{index=1}
+    chips = chips_from_signals(signals)  # returns <span> badges
     if chips:
-        st.markdown(" ".join(chips), unsafe_allow_html=True)  # <-- fix (was st.write)
+        st.markdown(" ".join(chips), unsafe_allow_html=True)
 
     with st.expander("Evidence details"):
         for k, v in signals.get("details", {}).items():
@@ -202,7 +227,6 @@ if "last_result" in st.session_state:
     st.divider()
     st.subheader("Recommended Plays")
 
-    # Type colors
     type_colors = {
         "pricing": "#10B981",
         "retention": "#3B82F6",
@@ -305,17 +329,15 @@ if "last_result" in st.session_state:
                         "status": decision
                     })
                     if use_backend:
-                        import requests
                         try:
                             requests.post(
-                                f"{backend_url.rstrip('/')}/decision",
-                                json={
+                                _burl("/decision"), headers=headers, json={
                                     "play_id": play["id"],
                                     "play_title": play["title"],
                                     "status": decision.lower(),
                                     "rationale": rationale,
                                     "actor": "user",
-                                },
+                                }, timeout=30
                             )
                         except Exception:
                             pass
@@ -332,11 +354,10 @@ if "last_result" in st.session_state:
                         "status": "success",
                     })
                     if use_backend:
-                        import requests
                         try:
                             requests.post(
-                                f"{backend_url.rstrip('/')}/integrations/push",
-                                json={"play_title": play["title"], "target": target},
+                                _burl("/integrations/push"), headers=headers,
+                                json={"play_title": play["title"], "target": target}, timeout=30
                             )
                         except Exception:
                             pass
