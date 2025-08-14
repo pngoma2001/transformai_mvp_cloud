@@ -1,23 +1,25 @@
-
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
+from pathlib import Path
 
 def export_summary_pdf(path, company, kpis, decisions, evidence=None, logo_path="assets/logo.png"):
     c = canvas.Canvas(path, pagesize=LETTER)
     width, height = LETTER
 
-    # Header
+    # Header with logo (optional) + brand color
     try:
-        c.drawImage(logo_path, 1*inch, height-0.9*inch, width=1.8*inch, preserveAspectRatio=True, mask="auto")
+        if Path(logo_path).exists():
+            c.drawImage(logo_path, 1*inch, height-0.9*inch, width=1.8*inch, preserveAspectRatio=True, mask="auto")
     except Exception:
         pass
     c.setFillColor(colors.HexColor("#4F46E5"))
     c.setFont("Helvetica-Bold", 16)
     c.drawString(1*inch, height-1.05*inch, f"TransformAI Summary — {company}")
     c.setFont("Helvetica", 10)
-    c.drawString(1*inch, height-1.2*inch, f"Period: {kpis.get('period','')}")
+    c.setFillColor(colors.black)
+    c.drawString(1*inch, height-1.25*inch, f"Period: {kpis.get('period','')}")
 
     # KPIs
     y = height - 1.6*inch
@@ -48,30 +50,29 @@ def export_summary_pdf(path, company, kpis, decisions, evidence=None, logo_path=
             if y < 1*inch:
                 c.showPage(); y = height - 1*inch
 
-    # Evidence appendix
+    # Evidence appendix (optional)
     try:
         _draw_evidence_appendix(c, evidence, width, height)
     except Exception:
         pass
+
     c.save()
 
-
 def _draw_evidence_appendix(c, evidence, width, height):
-    from reportlab.lib.units import inch
-    from reportlab.lib import colors
+    if not evidence:
+        return
     c.showPage()
     c.setFont("Helvetica-Bold", 14)
     c.drawString(1*inch, height-1*inch, "Evidence Appendix")
     y = height - 1.3*inch
     c.setFont("Helvetica", 10)
-    if not evidence:
-        c.drawString(1*inch, y, "No additional evidence supplied."); return
+
     order = [("Pricing power","pricing_power","recommended_uplift"),
              ("Churn risk","churn_risk","recommended_reduction"),
              ("Supply stress","supply_stress","recommended_delta"),
              ("Utilization gap","utilization_gap","recommended_delta")]
     for title, key, rec in order:
-        block = evidence.get(key, {})
+        block = (evidence or {}).get(key, {}) if evidence else {}
         level = (block.get("level","") or "").title()
         c.drawString(1*inch, y, f"{title}: {level}"); y -= 0.18*inch
         rec_val = block.get(rec)
@@ -82,4 +83,3 @@ def _draw_evidence_appendix(c, evidence, width, height):
         y -= 0.1*inch
         if y < 1*inch:
             c.showPage(); y = height - 1*inch
-    c.showPage()
