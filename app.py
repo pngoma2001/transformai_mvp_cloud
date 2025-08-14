@@ -1,208 +1,263 @@
-# app.py
-# TransformAI — Streamlit MVP (cloud-safe)
+# app.py — TransformAI (Streamlit cloud-safe)
 from __future__ import annotations
 
 import io
 from pathlib import Path
 from datetime import datetime
 import json
+import time
+
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-# ---------- Page setup ----------
+# ───────────────────────────── Page setup ─────────────────────────────
 st.set_page_config(
     page_title="TransformAI — Portfolio Analyzer",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ---------- Safe header / logo ----------
-def render_header():
+# ───────────────────────────── Header / Hero ──────────────────────────
+def render_header() -> None:
     logo_path = Path("assets/logo.png")
     if logo_path.exists():
-        st.image(str(logo_path), width=260)
+        # Safe: only show the image if the file exists
+        st.image(str(logo_path), width=220)
     else:
-        # Fallback title when logo file is not present in the repo
+        # Fallback brand header so the app never crashes on missing asset
         st.markdown(
-            "<div style='font-size:32px; font-weight:700; margin:0;'>TransformAI</div>"
-            "<div style='color:#6b7280; margin-top:4px;'>AI playbooks for EBITDA growth & cost reduction</div>",
+            """
+            <div style="font-size:30px;font-weight:700;margin:0;">TransformAI</div>
+            <div style="opacity:.75;margin-top:4px;">AI playbooks for EBITDA growth & cost reduction</div>
+            """,
             unsafe_allow_html=True,
         )
 
 render_header()
 st.divider()
 
-# ---------- Sample data ----------
+# ───────────────────────────── Sidebar (optional AI) ─────────────────
+st.sidebar.header("TransformAI")
+use_ai = st.sidebar.toggle("Enable AI-generated plays", value=False, help="Optional. App works without this.")
+provider = st.sidebar.selectbox("Provider", ["OpenAI", "Anthropic"], index=0, disabled=not use_ai)
+model_name = st.sidebar.text_input("Model name", value="gpt-4o-mini", disabled=not use_ai)
+creativity = st.sidebar.slider("Creativity", 0.0, 1.0, 0.2, 0.01, disabled=not use_ai)
+backend_url = st.sidebar.text_input("Backend URL (optional)")
+
+# ───────────────────────────── Sample data helpers ────────────────────
 def make_sample_df(kind: str) -> pd.DataFrame:
-    # 8 quarters of mock data per company type
+    """Return 8 quarters of made-up KPIs for a sample company."""
     periods = pd.period_range("2023Q1", "2024Q4", freq="Q")
     df = pd.DataFrame({"period": periods.astype(str)})
-
     if kind == "RetailCo":
-        df["revenue"] = [4.1, 4.3, 4.0, 4.5, 4.9, 5.0, 5.2, 5.6]
-        df["ebitda"] =  [0.35,0.38,0.30,0.42,0.48,0.51,0.55,0.62]
-        df["customers"]=[120,125,118,130,136,138,142,150]
-        df["cogs"] =     [2.7,2.8,2.7,2.9,3.0,3.1,3.2,3.3]
-    elif kind == "SaaSCo":
-        df["revenue"] = [1.8, 2.0, 2.2, 2.5, 2.8, 3.1, 3.3, 3.6]
-        df["ebitda"] =  [-0.1,-0.05,0.0,0.1,0.18,0.25,0.32,0.40]
-        df["customers"]=[220,240,260,290,320,350,380,420]
-        df["cogs"] =     [0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85]
-    else: # MarketplaceCo
-        df["revenue"] = [3.2, 3.4, 3.3, 3.7, 4.2, 4.6, 4.9, 5.3]
-        df["ebitda"] =  [0.2, 0.22,0.18,0.25,0.3, 0.36,0.42,0.50]
-        df["customers"]=[500,520,510,540,580,610,640,680]
-        df["cogs"] =     [1.8,1.9,1.85,2.0,2.2,2.3,2.4,2.6]
-
+        df["revenue"] = [41.4, 43.0, 44.5, 45.9, 49.5, 50.2, 52.0, 56.3]
+        df["ebitda"]  = [ 9.5, 10.0, 10.2, 10.4, 10.8, 11.0, 11.5, 12.0]
+        df["gross_margin"] = [34.0, 34.8, 35.2, 35.7, 36.1, 36.5, 36.9, 37.0]
+        df["churn_rate"]   = [21.0, 21.2, 21.0, 20.9, 20.8, 20.7, 20.6, 20.6]
+        df["turns_util"]   = [6.8, 6.9, 7.0, 7.1, 7.2, 7.2, 7.3, 7.45]
+    else:  # HealthCo
+        df["revenue"] = [28.2, 28.8, 29.1, 29.9, 31.2, 31.7, 32.4, 33.0]
+        df["ebitda"]  = [ 5.1,  5.2,  5.3,  5.4,  5.6,  5.7,  5.8,  6.0]
+        df["gross_margin"] = [38.0, 38.1, 38.2, 38.4, 38.6, 38.7, 38.8, 39.0]
+        df["churn_rate"]   = [12.0, 12.1, 12.2, 12.3, 12.3, 12.2, 12.1, 12.0]
+        df["turns_util"]   = [4.8,  4.9,  5.0,  5.1,  5.1,  5.2,  5.2,  5.3]
     return df
 
-SAMPLES = ["RetailCo", "SaaSCo", "MarketplaceCo"]
+SAMPLES = {
+    "RetailCo": make_sample_df("RetailCo"),
+    "HealthCo": make_sample_df("HealthCo"),
+}
 
-# ---------- Helpers ----------
 def read_csv(file) -> pd.DataFrame:
-    try:
-        return pd.read_csv(file)
-    except Exception:
-        # Try bytes -> StringIO if user uploaded a BytesIO from Streamlit
-        if hasattr(file, "getvalue"):
-            return pd.read_csv(io.StringIO(file.getvalue().decode("utf-8", errors="ignore")))
-        raise
+    return pd.read_csv(file)
 
 def has_multi_periods(df: pd.DataFrame) -> bool:
     return "period" in df.columns and df["period"].nunique() > 1
 
 def summarize(df: pd.DataFrame) -> dict:
-    out = {}
-    if "revenue" in df.columns:
-        out["latest_revenue"] = float(df["revenue"].iloc[-1])
-        if has_multi_periods(df):
-            out["revenue_cagr"] = (
-                (df["revenue"].iloc[-1] / max(df["revenue"].iloc[0], 1e-9)) ** (1 / (len(df) - 1)) - 1
-            )
-    if "ebitda" in df.columns:
-        out["latest_ebitda"] = float(df["ebitda"].iloc[-1])
-        if has_multi_periods(df):
-            out["ebitda_margin_latest"] = float(df["ebitda"].iloc[-1] / max(df["revenue"].iloc[-1], 1e-9))
-    return out
+    """Compute key KPIs + last-period snapshot."""
+    last = df.iloc[-1]
+    kpis = {
+        "company": st.session_state.get("company_name", "UnknownCo"),
+        "revenue": float(last.get("revenue", 0)),
+        "ebitda": float(last.get("ebitda", 0)),
+        "gross_margin": float(last.get("gross_margin", 0)),
+        "churn_rate": float(last.get("churn_rate", 0)),
+        "turns_util": float(last.get("turns_util", 0)),
+    }
+    # year-over-year revenue change if periods allow
+    if has_multi_periods(df) and len(df) >= 5:
+        kpis["revenue_yoy"] = float((df["revenue"].iloc[-1] - df["revenue"].iloc[-5]) / df["revenue"].iloc[-5] * 100.0)
+    else:
+        kpis["revenue_yoy"] = None
+    return kpis
 
-def simple_playbook(df: pd.DataFrame) -> list[str]:
-    tips = []
-    if "ebitda" in df.columns and "revenue" in df.columns:
-        margin = df["ebitda"].iloc[-1] / max(df["revenue"].iloc[-1], 1e-9)
-        if margin < 0.1:
-            tips.append("Renegotiate top 5 vendor contracts; target 3–5% COGS reduction.")
-        elif margin < 0.2:
-            tips.append("Pilot pricing test on 10–20% of SKUs to lift blended take-rate by 50–100 bps.")
-        else:
-            tips.append("Double down on high-margin segments; shift 10% paid spend to proven channels.")
-    if "customers" in df.columns and has_multi_periods(df):
-        gr = (df["customers"].iloc[-1] / max(df["customers"].iloc[0], 1e-9)) ** (1/(len(df)-1)) - 1
-        if gr < 0.05:
-            tips.append("Stand up referral program and onboarding nudges to improve top-of-funnel velocity.")
-    if "cogs" in df.columns and "revenue" in df.columns:
-        cogs_ratio = df["cogs"].iloc[-1] / max(df["revenue"].iloc[-1], 1e-9)
-        if cogs_ratio > 0.6:
-            tips.append("Run supplier consolidation: 80/20 SKU coverage with volume discounts.")
-    if not tips:
-        tips.append("Maintain course; expand proven initiatives and monitor unit economics monthly.")
-    return tips
+def simple_playbook(df: pd.DataFrame, kpis: dict) -> list[dict]:
+    """Deterministic, non-LLM recommendations."""
+    plays = []
+    # Pricing
+    plays.append({
+        "id": "pricing",
+        "title": "Pricing Optimization",
+        "confidence": "High",
+        "complexity": "Medium",
+        "assumed_increase": 0.06,  # slider default
+        "rationale": "Top 30% SKUs show low elasticity; raise prices 5–7% with guardrails.",
+        "uplift_estimate": round(kpis["revenue"] * 0.06 * 0.3 * 0.3, 2)  # rough demo math
+    })
+    # Retention
+    plays.append({
+        "id": "retention",
+        "title": "Customer Retention Program",
+        "confidence": "Medium",
+        "complexity": "Medium",
+        "assumed_decrease": 0.02,
+        "rationale": "Lifecycle messaging & loyalty offers to reduce churn by ~2%.",
+        "uplift_estimate": round(kpis["revenue"] * 0.02 * 0.4, 2),
+    })
+    # Supply chain / utilization
+    plays.append({
+        "id": "utilization",
+        "title": "Inventory & Utilization Tuning",
+        "confidence": "Medium",
+        "complexity": "Low",
+        "rationale": "Tune reorder points and slotting; improve turns/utilization.",
+        "uplift_estimate": round(kpis["revenue"] * 0.01, 2),
+    })
+    return plays
 
-# ---------- Sidebar (mock admin / templates) ----------
-with st.sidebar:
-    st.subheader("Templates (mock admin)")
-    st.caption("Simulate learning loop by bumping the template version.")
-    if "tpl_version" not in st.session_state:
-        st.session_state.tpl_version = 1
-    st.write(f"Template version: **v{st.session_state.tpl_version}**")
-    if st.button("Bump Version"):
-        st.session_state.tpl_version += 1
-        st.success(f"Bumped to v{st.session_state.tpl_version}")
+# ───────────────────────────── UI — Data selection ────────────────────
+st.markdown("Upload a CSV or use a sample dataset to generate recommended plays with estimated EBITDA uplift.")
 
-    st.markdown("---")
-    st.subheader("Sample CSVs")
-    chosen = st.selectbox("Download a sample", SAMPLES, index=0)
-    sample_df = make_sample_df(chosen)
-    csv_bytes = sample_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download sample CSV",
-        data=csv_bytes,
-        file_name=f"{chosen}_sample.csv",
-        mime="text/csv",
-    )
-    st.caption("Load this back into the app to try multi-period charts.")
-
-# ---------- Main UI ----------
-st.write("Upload a CSV or pick a sample company, then click **Analyze**.")
-
-col1, col2 = st.columns([1, 1])
-with col1:
-    sample_choice = st.selectbox("Choose a sample company", SAMPLES, index=0)
-with col2:
-    uploaded = st.file_uploader("Or upload your CSV", type=["csv"])
+sample = st.selectbox("Choose a sample company", list(SAMPLES.keys()))
+uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
 
 with st.expander("Evidence Sources (optional)"):
-    url_evidence = st.text_input("Paste a relevant URL (market data, news, etc.)", value="")
-    pdfs = st.file_uploader("Attach PDFs (optional)", type=["pdf"], accept_multiple_files=True)
+    st.write("Attach extra signals to make recommendations more contextual (optional).")
+    survey_file = st.file_uploader("Customer survey (CSV)", type=["csv"], key="survey")
+    market_file = st.file_uploader("Market data (CSV)", type=["csv"], key="market")
+    use_sample_evidence = st.checkbox("Use sample evidence if not provided", value=True)
 
-analyze = st.button("Analyze", type="primary")
+# Resolve primary dataframe
+if uploaded is not None:
+    df = read_csv(uploaded)
+    st.session_state["company_name"] = Path(uploaded.name).stem.title()
+else:
+    df = SAMPLES[sample].copy()
+    st.session_state["company_name"] = sample
 
-# ---------- Analysis ----------
-if analyze:
-    if uploaded is not None:
-        df = read_csv(uploaded)
-        st.info("Using your uploaded CSV.")
-    else:
-        df = make_sample_df(sample_choice)
-        st.info(f"Using sample dataset: **{sample_choice}**.")
+# Optional evidence — safely read (these blocks must be indented under the expander)
+survey_df = None
+market_df = None
+if survey_file is not None:
+    survey_df = read_csv(survey_file)
+elif use_sample_evidence:
+    sample_path = Path("data/sample_customer_survey.csv")
+    if sample_path.exists():
+        survey_df = pd.read_csv(sample_path)
 
-    # Basic validations
-    if "revenue" not in df.columns or "ebitda" not in df.columns:
-        st.error("Your data should include at least 'period', 'revenue', and 'ebitda' columns.")
-        st.stop()
+if market_file is not None:
+    market_df = read_csv(market_file)
+elif use_sample_evidence:
+    sample_path = Path("data/sample_market.csv")
+    if sample_path.exists():
+        market_df = pd.read_csv(sample_path)
 
-    if "period" in df.columns:
-        # Best effort ordering by period if values look sortable
-        try:
-            # Try to parse common period strings (YYYYQ#, YYYY-MM, etc.)
-            # If parse fails, we’ll stick to the given order
-            parsed = pd.PeriodIndex(df["period"].astype(str))
-            df = df.iloc[pd.Series(parsed).argsort(kind="mergesort")].reset_index(drop=True)
-        except Exception:
-            pass
+# ───────────────────────────── Action ─────────────────────────────────
+st.divider()
+if st.button("Generate Playbook", type="primary"):
+    kpis = summarize(df)
+    st.session_state["kpis"] = kpis
+    st.session_state["decisions"] = []
+    st.session_state["activity"] = []
 
+# When we have KPIs, render the summary and plays
+kpis = st.session_state.get("kpis")
+if kpis:
     # Summary
-    st.subheader("Summary")
-    meta = summarize(df)
-    cols = st.columns(3)
-    cols[0].metric("Latest Revenue", f"${meta.get('latest_revenue', float('nan')):,.2f}M")
-    cols[1].metric("Latest EBITDA", f"${meta.get('latest_ebitda', float('nan')):,.2f}M")
-    if "revenue_cagr" in meta:
-        cols[2].metric("Revenue CAGR", f"{meta['revenue_cagr']*100:.1f}%")
+    st.subheader(f"Summary — {kpis['company']} ({df['period'].iloc[-1] if 'period' in df.columns else 'Latest'})")
 
-    # Charts
+    cols = st.columns(5)
+    cols[0].metric("Revenue", f"${kpis['revenue']:,.0f}", (f"{kpis['revenue_yoy']:.1f}% YoY" if kpis['revenue_yoy'] is not None else None))
+    cols[1].metric("EBITDA", f"${kpis['ebitda']:,.0f}")
+    cols[2].metric("Gross Margin", f"{kpis['gross_margin']:.1f}%")
+    cols[3].metric("Churn Rate", f"{kpis['churn_rate']:.1f}%")
+    cols[4].metric("Turns/Utilization", f"{kpis['turns_util']:.2f}")
+
+    # Trend chart (if multiple periods)
     if has_multi_periods(df):
-        st.subheader("Trends")
+        trend = df[["period", "revenue", "ebitda"]].copy()
+        trend = trend.set_index("period")
+        st.line_chart(trend)
+
+    # Plays
+    st.subheader("Recommended Plays")
+    plays = simple_playbook(df, kpis)
+
+    if "decisions" not in st.session_state:
+        st.session_state["decisions"] = []
+
+    for play in plays:
+        with st.container(border=True):
+            st.markdown(f"**{play['title']}**")
+            st.caption(f"Confidence: {play['confidence']} • Complexity: {play['complexity']}")
+            st.write(play["rationale"])
+            if "assumed_increase" in play:
+                amt = st.slider(
+                    "Assumed price increase",
+                    min_value=0.00, max_value=0.10, value=play["assumed_increase"], step=0.01,
+                    key=f"inc_{play['id']}",
+                )
+            st.write(f"Estimated revenue impact (very rough): **${play['uplift_estimate']:,.0f}**")
+
+            # Decision radio
+            decision = st.radio("Decision", ["Pending", "Approved", "Rejected"], horizontal=True, key=f"dec_{play['id']}")
+            rationale = st.text_input("Rationale (optional)", key=f"rat_{play['id']}")
+            if st.button("Save decision", key=f"save_{play['id']}"):
+                st.session_state["decisions"].append({
+                    "id": play["id"],
+                    "title": play["title"],
+                    "decision": decision.lower(),
+                    "rationale": rationale,
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+                st.success("Saved.")
+
+            st.divider()
+            if st.button("Push to Salesforce (mock)", key=f"push_{play['id']}"):
+                st.session_state.setdefault("activity", []).append({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "action": "push",
+                    "play": play["title"],
+                    "target": "salesforce",
+                    "status": "success",
+                })
+                # If you later run a backend, you can POST here.
+                st.success("Integration job queued → success")
+
+    # Activity
+    st.subheader("Activity Log")
+    if len(st.session_state.get("activity", [])) == 0:
+        st.info("No activity yet.")
+    else:
+        st.dataframe(pd.DataFrame(st.session_state["activity"]))
+
+    # Export PDF (optional)
+    if st.button("Export Summary PDF"):
         try:
-            fig = px.line(df, x="period", y=["revenue", "ebitda"], markers=True)
-            fig.update_layout(yaxis_title="USD (Millions)")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            st.warning("Could not render chart. Check that 'period' is a consistent sequence.")
+            from pdf_utils import export_summary_pdf
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                export_summary_pdf(tmp.name, kpis.get("company"), kpis, st.session_state["decisions"])
+                tmp.flush()
+                st.download_button(
+                    "Download PDF",
+                    data=open(tmp.name, "rb").read(),
+                    file_name="transformai_summary.pdf",
+                    mime="application/pdf",
+                )
+        except Exception as ex:
+            st.warning(f"PDF export unavailable: {ex}")
 
-    # Playbook (rule-based stub; LLM can be added later)
-    st.subheader("Recommended Playbook")
-    for tip in simple_playbook(df):
-        st.write(f"• {tip}")
-
-    # Evidence echo (no parsing, just record)
-    if url_evidence or pdfs:
-        st.markdown("**Evidence provided:**")
-        if url_evidence:
-            st.write(f"- URL: {url_evidence}")
-        for f in (pdfs or []):
-            st.write(f"- PDF: {f.name}")
-
-st.markdown("---")
-st.caption("TransformAI MVP — front-end only. Logo optional; app runs without /assets.")
-
+else:
+    st.info("Choose a sample or upload a CSV, then click **Generate Playbook**.")
