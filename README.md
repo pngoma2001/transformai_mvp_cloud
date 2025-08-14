@@ -1,11 +1,12 @@
-
-## Evidence Sources (optional)
-
-Upload any of the following CSVs (or tick "Use sample evidence files") to improve recommendations:
-- `customer_survey.csv` → columns: respondent_id, nps, price_sensitivity_low, price_sensitivity_high
-- `market_prices.csv` → columns: sku, our_price, comp_price, units_share
-- `macro.csv` → columns: date, cpi_category, value
-- `stockouts.csv` → columns: sku, date, stockout_flag, lead_time_days
-- `utilization.csv` → columns: site, date, capacity, filled, no_show_rate
-
-The app computes indices (Pricing Power, Churn Risk, Supply Stress, Utilization Gap), shows them as chips, re‑orders plays, and adjusts default sliders. The PDF includes an Evidence appendix.
+# TransformAI Backend (FastAPI)
+Run locally:
+```bash
+pip install -r requirements.txt
+uvicorn fastapi_app:app --reload --port 8000
+```
+Endpoints:
+- POST /analyze (form-data: sample=RetailCo|HealthCo or file=csv)
+- POST /decision { play_id, play_title, status, rationale, actor }
+- GET /decisions
+- POST /integrations/push { play_title, target }
+- GET /activity
