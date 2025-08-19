@@ -1,6 +1,6 @@
 # pages/3_Diligence_Grid_Pro.py
-# Competitive mock "intersection" grid: evidence upload -> run quant modules -> approve -> memo -> PDF
-# No backend required. Uses session_state only. Paste a backend later without refactor.
+# Competitive mock "intersection" grid: evidence upload -> schema mapping -> quant modules -> approve -> memo -> PDF
+# No backend required. Uses session_state only. Ready to swap to HTTP backend later with the same contract.
 
 import io, uuid, math, textwrap, json
 from dataclasses import dataclass
@@ -15,22 +15,26 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
 st.set_page_config(page_title="Transform AI — Diligence Grid (Pro)", layout="wide")
-st.title("Diligence Grid (Pro) — mock, but investor-grade UX")
+st.title("Diligence Grid (Pro) — mock, investor-style UX")
+st.caption("Upload CSVs → Map schema (columns) → Add rows/columns → Run modules → Approve → Memo → Export PDF")
 
 # ------------------------------------------------------------------------------------
 # In-memory store (per user session)
 # ------------------------------------------------------------------------------------
 SS = st.session_state
 SS.setdefault("tables", {})         # name -> DataFrame
+SS.setdefault("schema_map", {})     # table_name -> {"customer","date","revenue","price","quantity"}
 SS.setdefault("grid", {             # grid runtime
     "id": f"grid_{uuid.uuid4().hex[:6]}",
     "rows": [],                    # [{id,row_ref,source}]
     "columns": [],                 # [{id,name,tool,params}]
-    "cells": [],                   # [{id,row_id,col_id,status,output,...,citations}]
+    "cells": [],                   # [{id,row_id,col_id,status,output,...,citations,figure}]
     "activities": []               # audit log
 })
 
-# Helpers
+# ------------------------------------------------------------------------------------
+# Helpers & logging
+# ------------------------------------------------------------------------------------
 def _log(action:str, detail:str=""):
     SS["grid"]["activities"].append({"id": uuid.uuid4().hex, "action": action, "detail": detail})
 
@@ -66,10 +70,20 @@ def _ensure_cells():
 def _find(df: pd.DataFrame, col: str) -> Optional[str]:
     # case-insensitive helper to guess a column name
     cols = {c.lower(): c for c in df.columns}
+    # exact or with _id suffix
     for k in (col.lower(), f"{col.lower()}_id"):
         if k in cols: return cols[k]
-    for k in cols:
-        if col.lower() in k: return cols[k]
+    # partial contains
+    needles = {
+        "customer": ["customer","user","buyer","account","client"],
+        "date": ["date","timestamp","order_date","created_at","period","month"],
+        "revenue": ["revenue","amount","net_revenue","sales","gmv","value"],
+        "price": ["price","unit_price","avg_price","p"],
+        "quantity": ["qty","quantity","units","volume","q"]
+    }.get(col.lower(), [col.lower()])
+    for n in needles:
+        for k in cols:
+            if n in k: return cols[k]
     return None
 
 # ------------------------------------------------------------------------------------
@@ -88,12 +102,15 @@ def module_cohort_retention(df: pd.DataFrame,
                             revenue_col: Optional[str]=None) -> ModuleResult:
     # Guess columns if not provided
     customer_col = customer_col or _find(df, "customer")
-    ts_col = ts_col or _find(df, "date") or _find(df, "timestamp") or _find(df, "order_date")
-    revenue_col = revenue_col or _find(df, "revenue") or _find(df, "amount") or _find(df, "net_revenue")
+    ts_col = ts_col or _find(df, "date")
+    revenue_col = revenue_col or _find(df, "revenue")
+
+    if not (isinstance(df, pd.DataFrame) and not df.empty):
+        return ModuleResult(kpis={}, narrative="Empty dataset.", citations=[])
 
     if not (customer_col and ts_col):
         return ModuleResult(
-            kpis={}, narrative="Missing customer/date columns; could not compute retention.",
+            kpis={}, narrative="Missing customer/date columns; map schema to compute retention.",
             citations=[]
         )
 
@@ -109,7 +126,6 @@ def module_cohort_retention(df: pd.DataFrame,
     active = d.groupby(["first_month", "age"])[customer_col].nunique()
     mat = (active / cohort_sizes).unstack(fill_value=0).sort_index()
 
-    # retention curve averaged across cohorts
     curve = mat.mean(axis=0) if not mat.empty else pd.Series(dtype=float)
     m3 = float(round(curve.get(3, np.nan), 4)) if not curve.empty else np.nan
 
@@ -117,7 +133,7 @@ def module_cohort_retention(df: pd.DataFrame,
     ltv_12 = None
     if revenue_col and revenue_col in d.columns:
         rev = d.groupby([customer_col, d[ts_col].dt.to_period("M")])[revenue_col].sum().groupby(customer_col).sum()
-        ltv_12 = float(round(rev.mean(), 2))
+        ltv_12 = float(round(float(rev.mean()), 2))
 
     fig = px.line(x=list(curve.index), y=list(curve.values),
                   labels={"x": "Months since first purchase", "y": "Retention"},
@@ -129,35 +145,36 @@ def module_cohort_retention(df: pd.DataFrame,
         narrative += f" Average 12-month LTV proxy ≈ ${ltv_12:,.2f}."
 
     citations = [{"type":"table","ref":"(uploaded CSV)","selector":"all_rows"}]
-    kpis = {"month_3_retention": m3, "ltv_12m": ltv_12, "cohort_count": int(cohort_sizes.shape[0])}
+    kpis = {"month_3_retention": m3, "ltv_12m": ltv_12, "cohort_count": int(cohort_sizes.shape[0]) if hasattr(cohort_sizes,'shape') else 0}
     return ModuleResult(kpis=kpis, narrative=narrative, citations=citations, figure=fig)
 
 def module_pricing_power(df: pd.DataFrame,
                          price_col: Optional[str]=None,
                          qty_col: Optional[str]=None) -> ModuleResult:
     price_col = price_col or _find(df, "price")
-    qty_col = qty_col or _find(df, "qty") or _find(df, "quantity") or _find(df, "units")
+    qty_col = qty_col or _find(df, "quantity")
+    if not (isinstance(df, pd.DataFrame) and not df.empty):
+        return ModuleResult(kpis={}, narrative="Empty dataset.", citations=[])
     if not (price_col and qty_col):
-        return ModuleResult(kpis={}, narrative="Missing price/quantity columns.", citations=[])
+        return ModuleResult(kpis={}, narrative="Missing price/quantity columns; map schema to compute elasticity.", citations=[])
 
-    d = df.copy()
-    d = d[[price_col, qty_col]].dropna()
+    d = df.copy()[[price_col, qty_col]].dropna()
     d = d[(d[price_col] > 0) & (d[qty_col] > 0)]
     if len(d) < 8:
-        return ModuleResult(kpis={}, narrative="Not enough observations for elasticity.", citations=[])
+        return ModuleResult(kpis={}, narrative="Not enough observations for elasticity (need ≥ 8 rows).", citations=[])
 
     # log-log regression for elasticity
     X = np.log(d[price_col].values)
     Y = np.log(d[qty_col].values)
     A = np.vstack([X, np.ones(len(X))]).T
     beta, intercept = np.linalg.lstsq(A, Y, rcond=None)[0]  # Y ≈ beta*X + intercept
-    elasticity = float(beta)  # should be negative
+    elasticity = float(beta)  # typically negative
     # R^2
     ss_res = float(np.sum((Y - (beta*X + intercept))**2))
     ss_tot = float(np.sum((Y - np.mean(Y))**2))
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-    fig = px.scatter(d, x=price_col, y=qty_col, trendline="ols", trendline_color_override="#999")
+    fig = px.scatter(d, x=price_col, y=qty_col, trendline="ols")
     narrative = f"Estimated own-price elasticity ≈ {elasticity:.2f} (R²={r2:.2f}). " + \
                 ("Pricing power appears strong (|ε|<1)." if abs(elasticity) < 1 else "Demand is elastic (|ε|≥1).")
     kpis = {"elasticity": elasticity, "r2": r2}
@@ -167,15 +184,15 @@ def module_pricing_power(df: pd.DataFrame,
                         figure=fig)
 
 MODULES = {
-    "cohort_retention": {"title":"Cohort Retention", "fn": module_cohort_retention},
-    "pricing_power": {"title":"Pricing Power", "fn": module_pricing_power},
+    "cohort_retention": {"title":"Cohort Retention", "fn": module_cohort_retention, "needs": ["customer","date"], "optional": ["revenue"]},
+    "pricing_power": {"title":"Pricing Power", "fn": module_pricing_power, "needs": ["price","quantity"], "optional": []},
 }
 
 # ------------------------------------------------------------------------------------
-# Evidence Graph (lite): upload CSVs -> becomes rows
+# Evidence Sources (CSV Upload)
 # ------------------------------------------------------------------------------------
 st.subheader("1) Evidence Sources (CSV)")
-up = st.file_uploader("Upload CSV(s) to analyze (customer transactions, price/qty, etc.)",
+up = st.file_uploader("Upload CSV(s) (transactions, price/qty, etc.)",
                       type=["csv"], accept_multiple_files=True)
 if up:
     for f in up:
@@ -184,10 +201,77 @@ if up:
             SS["tables"][name] = pd.read_csv(f)
             _log("SOURCE_ADDED", name)
             st.success(f"Loaded: {name} — {SS['tables'][name].shape[0]:,} rows")
+            # initialize blank mapping
+            SS["schema_map"].setdefault(name, {"customer": None, "date": None, "revenue": None, "price": None, "quantity": None})
         except Exception as e:
             st.error(f"{name}: {e}")
 
-# Auto-create rows from tables
+# ------------------------------------------------------------------------------------
+# CSV Schema Mapper
+# ------------------------------------------------------------------------------------
+st.subheader("2) Map CSV Schema")
+
+def _auto_guess_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    return {
+        "customer": _find(df, "customer"),
+        "date": _find(df, "date"),
+        "revenue": _find(df, "revenue"),
+        "price": _find(df, "price"),
+        "quantity": _find(df, "quantity"),
+    }
+
+def _apply_mapping_ui(table_name: str, df: pd.DataFrame):
+    st.markdown(f"**{table_name}** — {df.shape[0]:,} rows × {df.shape[1]:,} columns")
+    cols = list(df.columns)
+    cur = SS["schema_map"].get(table_name) or _auto_guess_map(df)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1:
+        customer = st.selectbox("Customer ID", options=["(none)"]+cols, index=(cols.index(cur["customer"])+1) if cur.get("customer") in cols else 0)
+    with c2:
+        date = st.selectbox("Date/Timestamp", options=["(none)"]+cols, index=(cols.index(cur["date"])+1) if cur.get("date") in cols else 0)
+    with c3:
+        revenue = st.selectbox("Revenue (optional)", options=["(none)"]+cols, index=(cols.index(cur["revenue"])+1) if cur.get("revenue") in cols else 0)
+    with c4:
+        price = st.selectbox("Price (optional)", options=["(none)"]+cols, index=(cols.index(cur["price"])+1) if cur.get("price") in cols else 0)
+    with c5:
+        qty = st.selectbox("Quantity (optional)", options=["(none)"]+cols, index=(cols.index(cur["quantity"])+1) if cur.get("quantity") in cols else 0)
+
+    # preview
+    prev_cols = [x for x in [customer, date, revenue, price, qty] if x != "(none)"]
+    if prev_cols:
+        st.dataframe(df[prev_cols].head(8), use_container_width=True)
+
+    # save
+    if st.button(f"Save mapping for {table_name}"):
+        SS["schema_map"][table_name] = {
+            "customer": None if customer=="(none)" else customer,
+            "date": None if date=="(none)" else date,
+            "revenue": None if revenue=="(none)" else revenue,
+            "price": None if price=="(none)" else price,
+            "quantity": None if qty=="(none)" else qty,
+        }
+        _log("SCHEMA_SAVED", table_name)
+        st.success("Mapping saved.")
+
+if SS["tables"]:
+    # bulk auto-map
+    if st.button("Auto-map all tables"):
+        for name, df in SS["tables"].items():
+            SS["schema_map"][name] = _auto_guess_map(df)
+        st.success("Auto-mapped based on header heuristics.")
+
+    # per-table mapping expanders
+    for name, df in SS["tables"].items():
+        with st.expander(f"Map schema — {name}", expanded=False):
+            _apply_mapping_ui(name, df)
+else:
+    st.info("Upload CSVs above to map schema.")
+
+# ------------------------------------------------------------------------------------
+# Create rows/columns
+# ------------------------------------------------------------------------------------
+st.subheader("3) Define Grid")
 c1, c2 = st.columns([1,4])
 with c1:
     if st.button("Add rows from all tables"):
@@ -197,10 +281,6 @@ with c1:
 with c2:
     st.caption("Each uploaded CSV becomes a **row** (e.g., transactions → cohort retention).")
 
-# ------------------------------------------------------------------------------------
-# Define columns (questions / metrics)
-# ------------------------------------------------------------------------------------
-st.subheader("2) Add Columns (metrics/questions)")
 col_name = st.text_input("Column label", value="Cohort retention")
 tool_key = st.selectbox("Module", options=list(MODULES.keys()), format_func=lambda k: MODULES[k]["title"])
 if st.button("Add Column"):
@@ -208,16 +288,15 @@ if st.button("Add Column"):
     _ensure_cells()
     st.success(f"Added column: {col_name} [{tool_key}]")
 
-# Show current grid plan
-st.caption("Grid plan")
-with st.expander("Rows & Columns", expanded=False):
+with st.expander("Rows & Columns (plan)", expanded=False):
     st.write("Rows:", SS["grid"]["rows"])
     st.write("Columns:", SS["grid"]["columns"])
+    st.write("Schema map:", SS["schema_map"])
 
 # ------------------------------------------------------------------------------------
-# Run cells
+# Run cells (uses schema mapping)
 # ------------------------------------------------------------------------------------
-st.subheader("3) Run Cells")
+st.subheader("4) Run Cells")
 sel_rows = st.multiselect("Rows to run", options=[r["id"] for r in SS["grid"]["rows"]],
                           format_func=lambda rid: next((r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid))
 sel_cols = st.multiselect("Columns to run", options=[c["id"] for c in SS["grid"]["columns"]],
@@ -229,11 +308,29 @@ def _run_cell(cell: Dict[str,Any]):
     cell["status"] = "running"
     table_name = row["source"]
     df = SS["tables"].get(table_name)
-    res = MODULES[col["tool"]]["fn"](df if isinstance(df, pd.DataFrame) else pd.DataFrame())
+    mapping = SS["schema_map"].get(table_name, {})
+
+    # route to module with mapped columns
+    if col["tool"] == "cohort_retention":
+        res = MODULES[col["tool"]]["fn"](
+            df if isinstance(df, pd.DataFrame) else pd.DataFrame(),
+            customer_col=mapping.get("customer"),
+            ts_col=mapping.get("date"),
+            revenue_col=mapping.get("revenue"),
+        )
+    elif col["tool"] == "pricing_power":
+        res = MODULES[col["tool"]]["fn"](
+            df if isinstance(df, pd.DataFrame) else pd.DataFrame(),
+            price_col=mapping.get("price"),
+            qty_col=mapping.get("quantity"),
+        )
+    else:
+        res = ModuleResult(kpis={}, narrative=f"Unknown tool {col['tool']}", citations=[])
+
     # persist outputs
     cell["status"] = "done" if res.kpis else "needs_review"
     cell["output_text"] = res.narrative
-    cell["numeric_value"] = list(res.kpis.values())[0] if res.kpis else None
+    cell["numeric_value"] = (list(res.kpis.values())[0] if res.kpis else None)
     cell["units"] = None
     cell["citations"] = res.citations
     cell["figure"] = res.figure
@@ -250,16 +347,15 @@ if st.button("Run selection"):
 # Table of cells
 cells_df = pd.DataFrame(SS["grid"]["cells"])
 if not cells_df.empty:
-    # display without heavy nested fields
     show = cells_df.drop(columns=[c for c in ["citations","figure","notes","confidence"] if c in cells_df.columns])
     st.dataframe(show, use_container_width=True, height=320)
 else:
-    st.info("No cells yet. Upload a CSV, add rows & a column, then Run.")
+    st.info("No cells yet. Upload a CSV, map schema, add rows & a column, then Run.")
 
 # ------------------------------------------------------------------------------------
-# Cell details + Approve/Retry
+# Review: cell details + Approve/Retry
 # ------------------------------------------------------------------------------------
-st.subheader("4) Review")
+st.subheader("5) Review")
 sel_cell_id = st.selectbox("Choose a cell", options=[c["id"] for c in SS["grid"]["cells"]], index=0 if SS["grid"]["cells"] else None)
 if sel_cell_id:
     cell = next(c for c in SS["grid"]["cells"] if c["id"]==sel_cell_id)
@@ -286,7 +382,7 @@ if sel_cell_id:
 # ------------------------------------------------------------------------------------
 # Memo composer + Export PDF
 # ------------------------------------------------------------------------------------
-st.subheader("5) Compose Memo & Export")
+st.subheader("6) Compose Memo & Export")
 
 def _build_memo() -> str:
     lines = [f"# Investment Memo — {SS['grid']['id']}", ""]
@@ -337,3 +433,4 @@ if memo_md:
 # ------------------------------------------------------------------------------------
 with st.expander("Activity Log", expanded=False):
     st.json(SS["grid"]["activities"])
+
