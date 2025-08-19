@@ -1,101 +1,113 @@
-import time
-import requests
 import pandas as pd
 import streamlit as st
+from services.backend_adapter import make_backend
 
-st.set_page_config(page_title="Transform AI — Grid (beta)", layout="wide")
-st.title("Transform AI — Grid (beta)")
+st.set_page_config(page_title="Transform AI — Grid", layout="wide")
+st.title("Transform AI — Grid")
 
-# --- Sidebar: backend config ---
+# --- Sidebar: choose backend or mock ---
 st.sidebar.header("Backend")
-backend_url = st.sidebar.text_input("Backend URL", value="http://127.0.0.1:8000")
-use_auth = st.sidebar.checkbox("Send API Key header", value=False)
-api_key = st.sidebar.text_input("API Key (optional)", value="dev-key-123" if use_auth else "", type="password")
+backend_url = st.sidebar.text_input("Backend URL (leave blank for mock)", value="")
+use_auth = st.sidebar.checkbox("Send API Key", value=bool(backend_url))
+api_key = st.sidebar.text_input("API Key", value="transformai-dev-001" if use_auth else "", type="password")
 
-def _headers():
-    if use_auth and api_key:
-        return {"x-api-key": api_key, "Content-Type": "application/json"}
-    return {"Content-Type": "application/json"}
+backend = make_backend(backend_url, api_key if use_auth else None)
 
-# --- Health check ---
-health_col1, health_col2 = st.columns([1, 3])
-with health_col1:
+# --- Health ---
+colh1, colh2 = st.columns([1,3])
+with colh1:
     if st.button("Check Health"):
         try:
-            r = requests.get(f"{backend_url}/health", timeout=8)
-            r.raise_for_status()
-            st.success("Backend OK")
-            st.json(r.json())
+            health = backend.health()
+            st.success(f"OK — mode: {health.get('mode')}")
+            st.json(health)
         except Exception as e:
-            st.error(f"Health check failed: {e}")
+            st.error(f"Health failed: {e}")
 
-# --- Session state for grid id ---
-if "grid_id" not in st.session_state:
-    st.session_state["grid_id"] = None
+# --- keep some state ---
+if "grid_id" not in st.session_state: st.session_state["grid_id"] = ""
+if "project_id" not in st.session_state: st.session_state["project_id"] = "proj_123"
 
 st.divider()
 
-# --- Create Sample Grid ---
-st.subheader("1) Create a sample grid")
-
+# --- Create grid ---
+st.subheader("1) Create grid")
 with st.form("create_grid_form"):
-    project_id = st.text_input("Project ID", value="proj_123")
-    grid_name = st.text_input("Grid Name", value="Alpha CDD")
-    # For MVP we use one metric column and one row referencing a CSV/doc
-    col_name = st.text_input("Column (metric name)", value="Cohort retention")
-    row_ref = st.text_input("Row ref (doc/entity)", value="doc:transactions.csv")
+    c1,c2,c3 = st.columns([1,1,1])
+    with c1: project_id = st.text_input("Project ID", value=st.session_state["project_id"])
+    with c2: grid_name   = st.text_input("Grid Name", value="Alpha CDD")
+    with c3: metric_name = st.text_input("Metric (column)", value="Cohort retention")
 
-    submitted = st.form_submit_button("Create Grid")
-    if submitted:
+    r1 = st.text_input("Row ref (doc/entity)", value="doc:transactions.csv")
+    if st.form_submit_button("Create Grid"):
         try:
-            payload = {
-                "project_id": project_id,
-                "name": grid_name,
-                "columns": [
-                    {"name": col_name, "kind": "metric", "tool": "cohort_retention", "params": {"window": "monthly"}}
-                ],
-                "rows": [{"row_ref": row_ref}],
-            }
-            r = requests.post(f"{backend_url}/grid", json=payload, headers=_headers(), timeout=15)
-            if r.status_code == 501:
-                st.error("Grid feature is disabled on the backend. Set FF_GRID_RUNTIME=true and restart the server.")
-            r.raise_for_status()
-            grid = r.json()
-            st.session_state["grid_id"] = grid["id"]
-            st.success(f"Grid created ✅  (grid_id: {grid['id']})")
-            st.json(grid)
+            res = backend.create_grid(project_id, grid_name,
+                                      columns=[{"name": metric_name, "kind":"metric", "tool":"cohort_retention"}],
+                                      rows=[{"row_ref": r1}])
+            st.session_state["grid_id"] = res["id"]
+            st.session_state["project_id"] = project_id
+            st.success(f"Created grid: {res['id']}")
+            st.json(res)
         except Exception as e:
-            st.error(f"Create Grid failed: {e}")
+            st.error(f"Create grid failed: {e}")
 
 st.divider()
 
-# --- List Cells ---
-st.subheader("2) View cells for the grid")
-grid_id_input = st.text_input("Grid ID", value=st.session_state.get("grid_id") or "")
-col_a, col_b = st.columns([1, 3])
-with col_a:
-    if st.button("Refresh Cells"):
-        if not grid_id_input:
-            st.warning("Enter a grid_id first (create one above).")
-        else:
-            try:
-                r = requests.get(f"{backend_url}/cells", params={"grid_id": grid_id_input}, headers=_headers(), timeout=15)
-                r.raise_for_status()
-                cells = r.json()
-                if not isinstance(cells, list):
-                    st.error("Unexpected response for /cells.")
-                else:
-                    df = pd.DataFrame(cells)
-                    if df.empty:
-                        st.info("No cells yet.")
-                    else:
-                        st.success(f"Loaded {len(df)} cells")
-                        st.dataframe(df, use_container_width=True)
-            except Exception as e:
-                st.error(f"List Cells failed: {e}")
+# --- List + run cells ---
+st.subheader("2) Cells")
+grid_id = st.text_input("Grid ID", value=st.session_state.get("grid_id",""))
+bcol1, bcol2, bcol3 = st.columns([1,1,6])
 
-# --- Friendly tips ---
-st.caption(
-    "Tips: If you get 501 on /grid, the backend flag FF_GRID_RUNTIME is off. "
-    "If you turned off auth (DISABLE_AUTH=true), uncheck 'Send API Key header'."
-)
+with bcol1:
+    if st.button("Refresh Cells"):
+        try:
+            cells = backend.list_cells(grid_id) if grid_id else []
+            st.session_state["cells_df"] = pd.DataFrame(cells) if cells else pd.DataFrame()
+        except Exception as e:
+            st.error(f"List cells failed: {e}")
+
+with bcol2:
+    if st.button("Run Cells"):
+        try:
+            res = backend.run_cells(grid_id)
+            st.toast(f"Ran: {res}")
+            cells = backend.list_cells(grid_id)
+            st.session_state["cells_df"] = pd.DataFrame(cells)
+        except Exception as e:
+            st.error(f"Run failed: {e}")
+
+df = st.session_state.get("cells_df", pd.DataFrame())
+if not df.empty:
+    st.dataframe(df, use_container_width=True, height=320)
+else:
+    st.info("No cells to show. Create a grid, then Refresh.")
+
+st.divider()
+
+# --- Approve & Memo (works in mock; HTTP version calls backend if available) ---
+st.subheader("3) Approvals & Memo")
+sel_cell_id = st.text_input("Cell ID to approve", value=df["id"].iloc[0] if not df.empty else "")
+acols = st.columns([1,1,2,6])
+with acols[0]:
+    if st.button("Approve Cell"):
+        try:
+            out = backend.approve_cell(sel_cell_id, note="Looks good.")
+            st.success(out)
+        except Exception as e:
+            st.error(f"Approve failed: {e}")
+with acols[1]:
+    if st.button("Compose Memo"):
+        try:
+            memo = backend.memo(st.session_state["project_id"])
+            st.json(memo)
+        except Exception as e:
+            st.error(f"Memo failed: {e}")
+with acols[2]:
+    if st.button("Export PDF"):
+        try:
+            out = backend.export_pdf(st.session_state["project_id"])
+            st.success(out)
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+
+st.caption("Tip: leave Backend URL empty to use the built-in mock backend. Paste your public FastAPI URL here later to go live.")
