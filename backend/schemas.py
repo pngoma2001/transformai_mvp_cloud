@@ -1,33 +1,40 @@
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
+# backend/schemas.py
+# Pydantic models used by FastAPI endpoints
 
+from typing import Optional
+from pydantic import BaseModel, ConfigDict
 
+# Keep compatibility with .from_orm(...) on Pydantic v2
+class _ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_orm(cls, obj):
+        return cls.model_validate(obj)
+
+# ---- Decision schemas ----
 class DecisionCreate(BaseModel):
-    play_id: str
-    play_title: str
-    status: str
-    rationale: Optional[str] = ""
-    actor: Optional[str] = "user"
+    play_id: Optional[str] = None
+    play_title: Optional[str] = None
+    status: Optional[str] = None
+    rationale: Optional[str] = None
+    actor: Optional[str] = None
 
+class DecisionOut(_ORMModel):
+    id: Optional[int] = None
+    play_id: Optional[str] = None
+    play_title: Optional[str] = None
+    status: Optional[str] = None
+    rationale: Optional[str] = None
+    actor: Optional[str] = None
+    ts: Optional[str] = None
 
-class DecisionOut(DecisionCreate):
-    ts: str
+# ---- Activity schemas ----
+class ActivityOut(_ORMModel):
+    id: Optional[int] = None
+    ts: Optional[str] = None
+    action: Optional[str] = None
+    play_title: Optional[str] = None
+    target: Optional[str] = None
+    status: Optional[str] = None
 
-    class Config:
-        orm_mode = True
-
-
-class ActivityOut(BaseModel):
-    ts: str
-    action: str
-    play_title: str
-    target: str
-    status: str
-
-    class Config:
-        orm_mode = True
-
-
-class AnalyzeResult(BaseModel):
-    kpis: Dict[str, Any]
-    plays: List[Dict[str, Any]]
