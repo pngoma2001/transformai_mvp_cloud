@@ -1,19 +1,24 @@
 # ---- Frontend (Streamlit) ----
 streamlit==1.36.0
 
-# Data
+# ---- Data & math ----
 pandas==2.3.1
 numpy==2.3.2
 plotly==6.3.0
 
-# PDF read + PDF export
+# ---- PDF read + PDF export ----
 pypdf>=4.0.0
 reportlab==4.4.3
 
-# HTTP + validation
-requests
-jsonschema
+# ---- Backend API (FastAPI server) ----
+fastapi>=0.110
+uvicorn[standard]>=0.23
+python-multipart>=0.0.9
 
-# (Optional) Model clients used elsewhere in the app
+# ---- HTTP + validation ----
+requests==2.32.5
+jsonschema==4.25.1
+
+# ---- (Optional) Model SDKs used elsewhere in the app ----
 openai>=1.30.0
 anthropic>=0.31.0
