@@ -1,23 +1,23 @@
 # pages/3_Diligence_Grid_Pro.py
 # TransformAI — Diligence Grid (Pro)
-# CSV + PDF evidence → schema mapping → run modules (Cohorts, Pricing, NRR/GRR, PDF KPIs)
-# → approve → clean memo export → evidence chat (no separate backend required).
+# Upload CSV/PDF → map schema → build grid → run modules → approve → clean memo export → evidence chat
+# No external backend required.
 
 from __future__ import annotations
 import io, uuid, re, textwrap, json
-from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
-# --- Optional PDF support (install pypdf to enable) ---
+# Optional PDF parsing
 try:
     from pypdf import PdfReader  # pip install pypdf>=4
 except Exception:
@@ -26,16 +26,16 @@ except Exception:
 # --------------------- PAGE SETUP ---------------------
 st.set_page_config(page_title="TransformAI — Diligence (Pro)", layout="wide")
 st.title("Transform AI — Diligence Grid (Pro)")
-st.caption("Upload CSV/PDF → map schema → run modules → approve → export clean memo → chat with evidence.")
+st.caption("Upload CSV/PDF → map schema → run Cohorts, Pricing, NRR/GRR, PDF KPIs → approve → Export Investor Memo.")
 
 SS = st.session_state
 SS.setdefault("tables", {})          # CSV name -> DataFrame
 SS.setdefault("docs", {})            # PDF name -> list[page_text]
 SS.setdefault("schema_map", {})      # CSV schema mapping
-SS.setdefault("chat_history", [])    # simple chat transcript
+SS.setdefault("chat_history", [])    # chat transcript
 SS.setdefault("grid", {
     "id": f"grid_{uuid.uuid4().hex[:6]}",
-    "rows": [],                      # [{id,row_ref,source,type}]
+    "rows": [],                      # [{id,row_ref,source,type,alias?}]
     "columns": [],                   # [{id,name,tool,params}]
     "cells": [],                     # [{...}]
     "activities": []                 # audit log
@@ -49,13 +49,13 @@ def _new_id(p): return f"{p}_{uuid.uuid4().hex[:8]}"
 
 def _add_row_from_table(name:str):
     rid = _new_id("row")
-    SS["grid"]["rows"].append({"id": rid, "row_ref": f"table:{name}", "source": name, "type": "table"})
+    SS["grid"]["rows"].append({"id": rid, "row_ref": f"table:{name}", "source": name, "type": "table", "alias": f"{name} (Transactions)"})
     _log("ROW_ADDED", f"table:{name}")
     return rid
 
 def _add_row_from_pdf(name:str):
     rid = _new_id("row")
-    SS["grid"]["rows"].append({"id": rid, "row_ref": f"pdf:{name}", "source": name, "type": "pdf"})
+    SS["grid"]["rows"].append({"id": rid, "row_ref": f"pdf:{name}", "source": name, "type": "pdf", "alias": f"{name} (KPI Pack)"})
     _log("ROW_ADDED", f"pdf:{name}")
     return rid
 
@@ -78,8 +78,17 @@ def _ensure_cells():
                     "citations": [], "confidence": None, "notes": [], "figure": None
                 })
 
+def delete_row(row_id: str):
+    SS["grid"]["rows"] = [r for r in SS["grid"]["rows"] if r["id"] != row_id]
+    SS["grid"]["cells"] = [c for c in SS["grid"]["cells"] if c["row_id"] != row_id]
+    _log("ROW_DELETED", row_id)
+
+def delete_col(col_id: str):
+    SS["grid"]["columns"] = [c for c in SS["grid"]["columns"] if c["id"] != col_id]
+    SS["grid"]["cells"] = [c for c in SS["grid"]["cells"] if c["col_id"] != col_id]
+    _log("COLUMN_DELETED", col_id)
+
 def _find(df: pd.DataFrame, key: str) -> Optional[str]:
-    # robust-ish header guesser
     candidates = {
         "customer": ["customer","user","buyer","account","client","cust","cust_id","customer_id"],
         "date":     ["date","timestamp","order_date","created_at","period","month"],
@@ -154,17 +163,14 @@ def module_pricing_power(df: pd.DataFrame,
     d = d[(d[price_col] > 0) & (d[qty_col] > 0)]
     if len(d) < 8:
         return ModuleResult({}, "Need ≥ 8 observations for elasticity regression.", [])
-    # log-log regression
     X = np.log(d[price_col].values)
     Y = np.log(d[qty_col].values)
     A = np.vstack([X, np.ones(len(X))]).T
     beta, intercept = np.linalg.lstsq(A, Y, rcond=None)[0]   # Y ≈ beta*X + intercept
-    # Plot scatter + fitted curve
     fig = px.scatter(d, x=price_col, y=qty_col, title="Price vs Quantity")
     xs = np.linspace(float(d[price_col].min()), float(d[price_col].max()), 60)
     ys = np.exp(beta*np.log(xs) + intercept)
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="fit"))
-    # R^2
     yhat = beta*X + intercept
     ss_res = float(np.sum((Y - yhat)**2))
     ss_tot = float(np.sum((Y - np.mean(Y))**2))
@@ -178,12 +184,11 @@ def module_pricing_power(df: pd.DataFrame,
         figure=fig
     )
 
-# --- NRR/GRR module ---
 def module_nrr_grr(df: pd.DataFrame,
                    customer_col: Optional[str]=None,
                    ts_col: Optional[str]=None,
                    revenue_col: Optional[str]=None) -> ModuleResult:
-    """Computes monthly GRR/NRR from revenue by customer."""
+    """Computes monthly GRR/NRR from revenue by customer (base = prior-month paying customers)."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return ModuleResult({}, "Empty dataset.", [])
     customer_col = customer_col or _find(df, "customer")
@@ -224,7 +229,7 @@ def module_nrr_grr(df: pd.DataFrame,
     fig.add_trace(go.Scatter(x=labels, y=nrr_list, mode="lines+markers", name="NRR"))
     fig.add_trace(go.Scatter(x=labels, y=grr_list, mode="lines+markers", name="GRR"))
     ymax = float(np.nanmax(nrr_list + grr_list)) if len(nrr_list + grr_list) else 1.0
-    fig.update_layout(title="Monthly NRR & GRR (Base customers from prior month)",
+    fig.update_layout(title="Monthly NRR & GRR (Base = prior-month payers)",
                       xaxis_title="Month", yaxis_title="Rate",
                       yaxis=dict(range=[0, max(1.2, ymax)]))
     last_label = labels[-1]
@@ -237,13 +242,12 @@ def module_nrr_grr(df: pd.DataFrame,
         "expansion_rate": float(round(expansion_rate[-1], 4)),
     }
     narrative = (f"Latest ({last_label}): GRR {kpis['grr']:.0%}, NRR {kpis['nrr']:.0%} "
-                 f"(expansion {kpis['expansion_rate']:.0%}, contraction {kpis['contraction_rate']:.0%}, "
-                 f"churn {kpis['churn_rate']:.0%}).")
+                 f"(expansion {kpis['expansion_rate']:.0%}, contraction {kpis['contraction_rate']:.0%}, churn {kpis['churn_rate']:.0%}).")
     return ModuleResult(kpis=kpis, narrative=narrative,
                         citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue by customer"}],
                         figure=fig)
 
-# --- PDF KPI extraction (regex-based, page-cited) ---
+# --- PDF KPI extraction (regex-based) ---
 _money = re.compile(r"\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:billion|bn|million|m)?", re.I)
 _pct   = re.compile(r"\d{1,3}(?:\.\d+)?\s*%")
 
@@ -307,8 +311,8 @@ def module_pdf_kpi(pages: List[str]) -> ModuleResult:
 MODULES = {
     "cohort_retention": {"title":"Cohort Retention (CSV)", "fn": module_cohort_retention, "needs": ["customer","date"], "optional": ["revenue"]},
     "pricing_power":   {"title":"Pricing Power (CSV)",   "fn": module_pricing_power,   "needs": ["price","quantity"], "optional": []},
-    "pdf_kpi_extract": {"title":"PDF KPI Extract",       "fn": module_pdf_kpi,          "needs": [], "optional": []},
-    "nrr_grr":         {"title":"NRR/GRR (CSV)",         "fn": module_nrr_grr,          "needs": ["customer","date","revenue"], "optional": []},
+    "nrr_grr":         {"title":"NRR/GRR (CSV)",         "fn": module_nrr_grr,         "needs": ["customer","date","revenue"], "optional": []},
+    "pdf_kpi_extract": {"title":"PDF KPI Extract",       "fn": module_pdf_kpi,         "needs": [], "optional": []},
 }
 
 # --------------------- 1) EVIDENCE SOURCES ---------------------
@@ -359,6 +363,7 @@ with st.expander("2) Map CSV Schema", expanded=False):
         for name, df in SS["tables"].items():
             SS["schema_map"][name] = _auto_guess(df)
         st.success("Guessed schemas.")
+
     for name, df in SS["tables"].items():
         st.markdown(f"**{name}** — {df.shape[0]:,} rows × {df.shape[1]:,} cols")
         cols = list(df.columns)
@@ -404,6 +409,40 @@ if st.button("Add Column"):
     _ensure_cells()
     st.success(f"Added column: {col_name} [{tool_key}]")
 
+if st.button("Add Starter Columns (4)"):
+    presets = [
+        ("Cohort Retention", "cohort_retention"),
+        ("Pricing Power", "pricing_power"),
+        ("NRR/GRR", "nrr_grr"),
+        ("PDF KPIs", "pdf_kpi_extract"),
+    ]
+    for name, tool in presets: _add_column(name, tool, {})
+    _ensure_cells()
+    st.success("Added Cohort Retention, Pricing Power, NRR/GRR, and PDF KPIs.")
+
+with st.expander("Manage rows & columns", expanded=False):
+    st.markdown("**Rows**")
+    for r in list(SS["grid"]["rows"]):
+        cols = st.columns([0.6, 0.3, 0.1])
+        with cols[0]:
+            r["alias"] = st.text_input(f"Alias for {r['row_ref']}", r.get("alias", r["row_ref"]), key=f"alias_{r['id']}")
+        with cols[1]:
+            st.caption(r["row_ref"])
+        with cols[2]:
+            if st.button("🗑️", key=f"delrow_{r['id']}"):
+                delete_row(r["id"]); st.experimental_rerun()
+    st.markdown("---")
+    st.markdown("**Columns**")
+    for c in list(SS["grid"]["columns"]):
+        cols = st.columns([0.7, 0.2, 0.1])
+        with cols[0]:
+            c["name"] = st.text_input(f"Column label ({c['tool']})", c["name"], key=f"colname_{c['id']}")
+        with cols[1]:
+            st.caption(c["tool"])
+        with cols[2]:
+            if st.button("🗑️", key=f"delcol_{c['id']}"):
+                delete_col(c["id"]); st.experimental_rerun()
+
 with st.expander("Plan (debug)", expanded=False):
     st.write("Rows:", SS["grid"]["rows"])
     st.write("Columns:", SS["grid"]["columns"])
@@ -411,7 +450,7 @@ with st.expander("Plan (debug)", expanded=False):
 # --------------------- 4) RUN CELLS ---------------------
 st.subheader("4) Run Cells")
 sel_rows = st.multiselect("Rows to run", options=[r["id"] for r in SS["grid"]["rows"]],
-                          format_func=lambda rid: next((r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid))
+                          format_func=lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid))
 sel_cols = st.multiselect("Columns to run", options=[c["id"] for c in SS["grid"]["columns"]],
                           format_func=lambda cid: next((c["name"] for c in SS["grid"]["columns"] if c["id"]==cid), cid))
 
@@ -419,6 +458,8 @@ def _run_cell(cell: Dict[str,Any]):
     row = next(x for x in SS["grid"]["rows"] if x["id"]==cell["row_id"])
     col = next(x for x in SS["grid"]["columns"] if x["id"]==cell["col_id"])
     cell["status"] = "running"
+
+    # Guardrails: CSV-only tools on table rows; PDF-only tool on PDF rows
     if row["type"] == "table":
         df = SS["tables"].get(row["source"])
         mapping = SS["schema_map"].get(row["source"], {})
@@ -437,9 +478,10 @@ def _run_cell(cell: Dict[str,Any]):
         if col["tool"] == "pdf_kpi_extract":
             res = module_pdf_kpi(pages)
         elif col["tool"] in ("cohort_retention","pricing_power","nrr_grr"):
-            res = ModuleResult({}, f"{col['tool']} applies to CSV rows.", [])
+            res = ModuleResult({}, f"{MODULES[col['tool']]['title']} applies to CSV rows.", [])
         else:
             res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
+
     cell["status"] = "done" if res.kpis else "needs_review"
     cell["output_text"] = res.narrative
     cell["numeric_value"] = (list(res.kpis.values())[0] if res.kpis else None)
@@ -455,11 +497,11 @@ if st.button("Run selection"):
     for cell in targets: _run_cell(cell)
     st.success(f"Ran {len(targets)} cell(s).")
 
-# --------------------- FRIENDLY INVESTOR TABLE ---------------------
+# --------------------- 4.1 INVESTOR RESULTS TABLE ---------------------
 st.subheader("4.1 Results (investor view)")
 if SS["grid"]["cells"]:
     grid = SS["grid"]
-    row_map = {r["id"]: f'{r["type"]}:{r["source"]}' for r in grid["rows"]}
+    row_map = {r["id"]: (r.get("alias") or f'{r["type"]}:{r["source"]}') for r in grid["rows"]}
     col_map = {c["id"]: c["name"] for c in grid["columns"]}
     df = pd.DataFrame(grid["cells"]).copy()
     df["Row"] = df["row_id"].map(row_map)
@@ -477,7 +519,7 @@ if sel_cell_id:
     cell = next(c for c in SS["grid"]["cells"] if c["id"]==sel_cell_id)
     col  = next(x for x in SS["grid"]["columns"] if x["id"]==cell["col_id"])
     row  = next(x for x in SS["grid"]["rows"] if x["id"]==cell["row_id"])
-    st.markdown(f"**{col['name']}** on _{row['row_ref']}_ — status: `{cell['status']}`")
+    st.markdown(f"**{col['name']}** on _{row.get('alias') or row['row_ref']}_ — status: `{cell['status']}`")
     if cell.get("figure") is not None:
         st.plotly_chart(cell["figure"], use_container_width=True)
     if cell.get("output_text"): st.write(cell["output_text"])
@@ -520,7 +562,7 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
     if not approved:
         line("No approved findings yet.", 11)
     for ccell in approved:
-        r = rows[ccell["row_id"]]; row_label = f"{r['type']}:{r['source']}"
+        r = rows[ccell["row_id"]]; row_label = r.get("alias") or f"{r['type']}:{r['source']}"
         col_title = cols[ccell["col_id"]]["name"]
         val = ccell.get("numeric_value")
         val_str = f" — value: {val:,.2f}" if isinstance(val,(int,float)) else ""
@@ -532,7 +574,7 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
     # Evidence Appendix
     y -= 4; line("Evidence Appendix", 12, True)
     for ccell in approved:
-        r = rows[ccell["row_id"]]; row_label = f"{r['type']}:{r['source']}"
+        r = rows[ccell["row_id"]]; row_label = r.get("alias") or f"{r['type']}:{r['source']}"
         col_title = cols[ccell["col_id"]]["name"]
         citations = ccell.get("citations") or []
         if not citations:
@@ -554,7 +596,6 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
     c.showPage(); c.save(); buf.seek(0)
     return buf.getvalue()
 
-# Compose & download
 left, right = st.columns([1,1])
 with left:
     if st.button("Compose (show markdown)"):
@@ -565,7 +606,7 @@ with left:
             row = next(x for x in SS["grid"]["rows"] if x["id"]==ccell["row_id"])
             val = ccell.get("numeric_value")
             val_s = f"{val:,.2f}" if isinstance(val,(int,float)) else (val or "")
-            lines.append(f"- **{col['name']}** on _{row['row_ref']}_ → {val_s} — {ccell.get('output_text','')}")
+            lines.append(f"- **{col['name']}** on _{row.get('alias') or row['row_ref']}_ → {val_s} — {ccell.get('output_text','')}")
         SS["last_memo_md"] = "\n".join(lines) or "# (no approved findings)"
         st.code(SS["last_memo_md"], language="markdown")
 
@@ -632,11 +673,11 @@ def answers_from_grid(q: str):
         text = (c.get("output_text") or "").lower()
         if any(tok in text for tok in re.findall(r"\w+", ql)):
             col = next((x for x in SS["grid"]["columns"] if x["id"]==c["col_id"]), {"name":"(unknown)"})
-            row = next((x for x in SS["grid"]["rows"] if x["id"]==c["row_id"]), {"row_ref":"(unknown)"})
+            row = next((x for x in SS["grid"]["rows"] if x["id"]==c["row_id"]), {"row_ref":"(unknown)","alias":"(unknown)"})
             hits.append({
                 "kind": "cell",
                 "col_name": col["name"],
-                "row_ref": row["row_ref"],
+                "row_ref": row.get("alias") or row["row_ref"],
                 "status": c.get("status"),
                 "output_text": c.get("output_text"),
                 "citations": c.get("citations", [])
@@ -671,7 +712,7 @@ if prompt:
         parts.append("**CSV matches:**")
         for h in csv_hits:
             row_count = h["preview"].shape[0] if isinstance(h["preview"], pd.DataFrame) else 0
-            parts.append(f"- `{h['source']}` — matches in columns/rows (showing {row_count} rows below).")
+            parts.append(f"- `{h['source']}` — column/row matches (showing {row_count} rows below).")
 
     if not (grid_hits or pdf_hits or csv_hits):
         parts.append("_No obvious matches. Try a different term (e.g., 'revenue', 'margin', 'price')._")
