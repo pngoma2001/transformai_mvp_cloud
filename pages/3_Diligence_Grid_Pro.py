@@ -1,7 +1,7 @@
 # pages/3_Diligence_Grid_Pro.py
 # TransformAI — Diligence Grid (Pro)
-# One-page demo: CSV+PDF evidence → schema mapping → run modules (Cohorts, Pricing, PDF KPIs, NRR/GRR)
-# → approve → memo → export → chat. No backend required.
+# CSV + PDF evidence → schema mapping → run modules (Cohorts, Pricing, NRR/GRR, PDF KPIs)
+# → approve → clean memo export → evidence chat (no separate backend required).
 
 from __future__ import annotations
 import io, uuid, re, textwrap, json
@@ -19,14 +19,14 @@ from reportlab.lib.units import inch
 
 # --- Optional PDF support (install pypdf to enable) ---
 try:
-    from pypdf import PdfReader  # pip install pypdf
+    from pypdf import PdfReader  # pip install pypdf>=4
 except Exception:
     PdfReader = None
 
 # --------------------- PAGE SETUP ---------------------
 st.set_page_config(page_title="TransformAI — Diligence (Pro)", layout="wide")
 st.title("Transform AI — Diligence Grid (Pro)")
-st.caption("Upload CSV / PDF → map schema → run modules → approve → compose memo → export PDF — all locally (mock).")
+st.caption("Upload CSV/PDF → map schema → run modules → approve → export clean memo → chat with evidence.")
 
 SS = st.session_state
 SS.setdefault("tables", {})          # CSV name -> DataFrame
@@ -69,8 +69,7 @@ def _ensure_cells():
     have = {(c["row_id"], c["col_id"]) for c in SS["grid"]["cells"]}
     for r in SS["grid"]["rows"]:
         for c in SS["grid"]["columns"]:
-            k = (r["id"], c["id"])
-            if k not in have:
+            if (r["id"], c["id"]) not in have:
                 SS["grid"]["cells"].append({
                     "id": _new_id("cell"),
                     "row_id": r["id"], "col_id": c["id"],
@@ -82,7 +81,7 @@ def _ensure_cells():
 def _find(df: pd.DataFrame, key: str) -> Optional[str]:
     # robust-ish header guesser
     candidates = {
-        "customer": ["customer","user","buyer","account","client","cust","cust_id"],
+        "customer": ["customer","user","buyer","account","client","cust","cust_id","customer_id"],
         "date":     ["date","timestamp","order_date","created_at","period","month"],
         "revenue":  ["revenue","amount","net_revenue","sales","gmv","value"],
         "price":    ["price","unit_price","avg_price","p"],
@@ -160,7 +159,7 @@ def module_pricing_power(df: pd.DataFrame,
     Y = np.log(d[qty_col].values)
     A = np.vstack([X, np.ones(len(X))]).T
     beta, intercept = np.linalg.lstsq(A, Y, rcond=None)[0]   # Y ≈ beta*X + intercept
-    # Plot scatter + fitted curve (no statsmodels dependency)
+    # Plot scatter + fitted curve
     fig = px.scatter(d, x=price_col, y=qty_col, title="Price vs Quantity")
     xs = np.linspace(float(d[price_col].min()), float(d[price_col].max()), 60)
     ys = np.exp(beta*np.log(xs) + intercept)
@@ -179,81 +178,48 @@ def module_pricing_power(df: pd.DataFrame,
         figure=fig
     )
 
-# --- NRR/GRR module (NEW) ---
+# --- NRR/GRR module ---
 def module_nrr_grr(df: pd.DataFrame,
                    customer_col: Optional[str]=None,
                    ts_col: Optional[str]=None,
                    revenue_col: Optional[str]=None) -> ModuleResult:
-    """
-    Computes monthly GRR/NRR from revenue by customer.
-    Definitions (per month t vs t-1, among base customers active at t-1):
-      start = revenue at t-1 for base customers
-      churn = revenue from base customers that drop to 0 at t
-      contraction = revenue decrease among base customers who stayed (excl. churn)
-      expansion = revenue increase among base customers who stayed
-      GRR = (start - churn - contraction) / start
-      NRR = (start - churn - contraction + expansion) / start
-    """
+    """Computes monthly GRR/NRR from revenue by customer."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return ModuleResult({}, "Empty dataset.", [])
-
-    # Infer columns if not provided
     customer_col = customer_col or _find(df, "customer")
     ts_col       = ts_col       or _find(df, "date")
     revenue_col  = revenue_col  or _find(df, "revenue")
     if not (customer_col and ts_col and revenue_col):
         return ModuleResult({}, "Need customer/date/revenue columns; map schema first.", [])
-
-    # Normalize to monthly revenue per customer
     d = df[[customer_col, ts_col, revenue_col]].copy()
     d[ts_col] = pd.to_datetime(d[ts_col], errors="coerce")
     d = d.dropna(subset=[customer_col, ts_col, revenue_col])
     d["month"] = d[ts_col].dt.to_period("M")
     gp = d.groupby([customer_col, "month"], as_index=False)[revenue_col].sum()
-
-    # Pivot to customers x months
-    pivot = gp.pivot(index=customer_col, columns="month", values=revenue_col).fillna(0.0)
-    pivot = pivot.sort_index(axis=1)  # months ascending
+    pivot = gp.pivot(index=customer_col, columns="month", values=revenue_col).fillna(0.0).sort_index(axis=1)
     months = list(pivot.columns)
-    if len(months) < 2:
-        return ModuleResult({}, "Need at least two months of data.", [])
-
+    if len(months) < 2: return ModuleResult({}, "Need at least two months of data.", [])
     labels, grr_list, nrr_list = [], [], []
     churn_rate, contraction_rate, expansion_rate = [], [], []
-
     for i in range(1, len(months)):
         prev_m, curr_m = months[i-1], months[i]
-        prev_rev = pivot[prev_m]
-        curr_rev = pivot[curr_m]
-
+        prev_rev, curr_rev = pivot[prev_m], pivot[curr_m]
         base_mask = prev_rev > 0
         start = float(prev_rev[base_mask].sum())
-        if start <= 0:
-            continue
-
+        if start <= 0: continue
         curr_base = curr_rev[base_mask]
-        # churn: customers with prev>0 and curr==0
         churn_amt = float(prev_rev[base_mask & (curr_base == 0)].sum())
-        # contraction: drop among those who stayed (excluding churn)
         contraction_amt = float(((prev_rev[base_mask] - curr_base).clip(lower=0.0).sum()) - churn_amt)
         contraction_amt = max(contraction_amt, 0.0)
-        # expansion: increase among those who stayed
         expansion_amt = float((curr_base - prev_rev[base_mask]).clip(lower=0.0).sum())
-
         grr = (start - churn_amt - contraction_amt) / start if start else np.nan
         nrr = (start - churn_amt - contraction_amt + expansion_amt) / start if start else np.nan
-
         labels.append(str(curr_m))
-        grr_list.append(grr)
-        nrr_list.append(nrr)
+        grr_list.append(grr); nrr_list.append(nrr)
         churn_rate.append(churn_amt / start)
         contraction_rate.append(contraction_amt / start)
         expansion_rate.append(expansion_amt / start)
-
-    if not labels:
-        return ModuleResult({}, "Insufficient month-to-month overlap to compute retention.", [])
-
-    # Chart
+    if not labels: return ModuleResult({}, "Insufficient overlap to compute NRR/GRR.", [])
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=labels, y=nrr_list, mode="lines+markers", name="NRR"))
     fig.add_trace(go.Scatter(x=labels, y=grr_list, mode="lines+markers", name="GRR"))
@@ -261,8 +227,6 @@ def module_nrr_grr(df: pd.DataFrame,
     fig.update_layout(title="Monthly NRR & GRR (Base customers from prior month)",
                       xaxis_title="Month", yaxis_title="Rate",
                       yaxis=dict(range=[0, max(1.2, ymax)]))
-
-    # Latest month KPIs
     last_label = labels[-1]
     kpis = {
         "month": last_label,
@@ -272,18 +236,14 @@ def module_nrr_grr(df: pd.DataFrame,
         "contraction_rate": float(round(contraction_rate[-1], 4)),
         "expansion_rate": float(round(expansion_rate[-1], 4)),
     }
-
     narrative = (f"Latest ({last_label}): GRR {kpis['grr']:.0%}, NRR {kpis['nrr']:.0%} "
-                 f"(expansion {kpis['expansion_rate']:.0%}, contraction {kpis['contraction_rate']:.0%}, churn {kpis['churn_rate']:.0%}).")
+                 f"(expansion {kpis['expansion_rate']:.0%}, contraction {kpis['contraction_rate']:.0%}, "
+                 f"churn {kpis['churn_rate']:.0%}).")
+    return ModuleResult(kpis=kpis, narrative=narrative,
+                        citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue by customer"}],
+                        figure=fig)
 
-    return ModuleResult(
-        kpis=kpis,
-        narrative=narrative,
-        citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue by customer"}],
-        figure=fig
-    )
-
-# --- PDF KPI extraction (regex-y, page-cited) ---
+# --- PDF KPI extraction (regex-based, page-cited) ---
 _money = re.compile(r"\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:billion|bn|million|m)?", re.I)
 _pct   = re.compile(r"\d{1,3}(?:\.\d+)?\s*%")
 
@@ -326,8 +286,7 @@ def _scan_metric(pages: List[str], keywords: List[str], want: str) -> Optional[D
     return None
 
 def module_pdf_kpi(pages: List[str]) -> ModuleResult:
-    if not pages:
-        return ModuleResult({}, "Empty PDF.", [])
+    if not pages: return ModuleResult({}, "Empty PDF.", [])
     rev = _scan_metric(pages, ["revenue","revenues","total revenue"], "money")
     ebt = _scan_metric(pages, ["ebitda","adj ebitda"], "money")
     gm  = _scan_metric(pages, ["gross margin","gm%","gm"], "pct")
@@ -386,7 +345,7 @@ with c_pdf:
             _log("SOURCE_ADDED", f"pdf:{f.name}")
             st.success(f"Loaded PDF: {f.name} ({len(pages)} pages)")
 
-# --------------------- CSV SCHEMA MAPPING ---------------------
+# --------------------- 2) MAP CSV SCHEMA ---------------------
 with st.expander("2) Map CSV Schema", expanded=False):
     def _auto_guess(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         return {
@@ -445,7 +404,7 @@ if st.button("Add Column"):
     _ensure_cells()
     st.success(f"Added column: {col_name} [{tool_key}]")
 
-with st.expander("Plan", expanded=False):
+with st.expander("Plan (debug)", expanded=False):
     st.write("Rows:", SS["grid"]["rows"])
     st.write("Columns:", SS["grid"]["columns"])
 
@@ -473,7 +432,7 @@ def _run_cell(cell: Dict[str,Any]):
             res = ModuleResult({}, "PDF module requires a PDF row.", [])
         else:
             res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
-    else:  # pdf
+    else:  # pdf row
         pages = SS["docs"].get(row["source"], [])
         if col["tool"] == "pdf_kpi_extract":
             res = module_pdf_kpi(pages)
@@ -496,10 +455,18 @@ if st.button("Run selection"):
     for cell in targets: _run_cell(cell)
     st.success(f"Ran {len(targets)} cell(s).")
 
-cells_df = pd.DataFrame(SS["grid"]["cells"])
-if not cells_df.empty:
-    hide = [c for c in ["citations","figure","notes","confidence"] if c in cells_df.columns]
-    st.dataframe(cells_df.drop(columns=hide), use_container_width=True, height=300)
+# --------------------- FRIENDLY INVESTOR TABLE ---------------------
+st.subheader("4.1 Results (investor view)")
+if SS["grid"]["cells"]:
+    grid = SS["grid"]
+    row_map = {r["id"]: f'{r["type"]}:{r["source"]}' for r in grid["rows"]}
+    col_map = {c["id"]: c["name"] for c in grid["columns"]}
+    df = pd.DataFrame(grid["cells"]).copy()
+    df["Row"] = df["row_id"].map(row_map)
+    df["Column"] = df["col_id"].map(col_map)
+    df["Summary"] = df.get("output_text", "").astype(str).str.slice(0, 160)
+    view_cols = ["Row", "Column", "status", "numeric_value", "Summary", "id"]
+    st.dataframe(df[view_cols], hide_index=True, use_container_width=True)
 else:
     st.info("No cells yet. Add rows & a column, then run.")
 
@@ -524,43 +491,88 @@ if sel_cell_id:
         if st.button("Mark Needs-Review"):
             cell["status"] = "needs_review"; _log("CELL_MARK_REVIEW", sel_cell_id); st.warning("Marked.")
 
-# --------------------- 6) MEMO & EXPORT ---------------------
+# --------------------- 6) CLEAN MEMO EXPORT ---------------------
 st.subheader("6) Compose Memo & Export")
 
-def _build_memo() -> str:
-    lines = [f"# Investment Memo — {SS['grid']['id']}", ""]
-    approved = [c for c in SS["grid"]["cells"] if c["status"]=="approved"]
-    if approved:
-        lines += ["## Executive Summary", f"- Approved findings: {len(approved)}"]
-        for c in approved[:8]:
-            col = next(x for x in SS["grid"]["columns"] if x["id"]==c["col_id"])
-            row = next(x for x in SS["grid"]["rows"] if x["id"]==c["row_id"])
-            val = c.get("numeric_value"); val_s = f"{val:,.0f}" if isinstance(val,(int,float)) else (val or "")
-            lines.append(f"  - **{col['name']}** on _{row['row_ref']}_ → {val_s} — {c.get('output_text','')}")
-        lines.append("")
-    lines.append("## Evidence Appendix")
-    for c in approved: lines.append(f"- Cell {c['id']} citations: {json.dumps(c.get('citations', []))}")
-    return "\n".join(lines)
+def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) -> bytes:
+    rows = {r["id"]: r for r in grid["rows"]}
+    cols = {c["id"]: c for c in grid["columns"]}
+    approved = [c for c in cells if c.get("status") == "approved"]
 
-def _memo_pdf_bytes(md: str) -> bytes:
-    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=LETTER)
-    W,H = LETTER; M = 0.75*inch; y = H-M
-    c.setFont("Helvetica-Bold", 14); c.drawString(M,y,"Transform AI — Investment Memo"); y -= 18
-    c.setFont("Helvetica", 9); c.drawString(M,y,f"Grid: {SS['grid']['id']}"); y -= 14
-    c.setFont("Helvetica", 11)
-    for line in md.splitlines():
-        for seg in textwrap.wrap(line, width=95) or [" "]:
-            if y < M: c.showPage(); y = H-M; c.setFont("Helvetica", 11)
-            c.drawString(M,y,seg); y -= 14
-    c.showPage(); c.save(); buf.seek(0); return buf.getvalue()
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=LETTER)
+    W,H = LETTER; M = 0.75*inch; y = H - M
 
-if st.button("Compose Memo"):
-    SS["last_memo_md"] = _build_memo()
-    st.code(SS["last_memo_md"], language="markdown")
+    def line(txt, size=11, bold=False, leading=14):
+        nonlocal y
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        for seg in textwrap.wrap(str(txt), width=95) or [" "]:
+            if y < M:
+                c.showPage(); y = H - M; c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+            c.drawString(M, y, seg); y -= leading
 
-if SS.get("last_memo_md"):
-    st.download_button("⬇️ Download PDF",
-                       data=_memo_pdf_bytes(SS["last_memo_md"]),
+    # Header
+    line("Transform AI — Investment Memo", 14, True, 16)
+    line(f"Grid: {grid.get('id', 'unknown')}", 9); y -= 6
+
+    # Executive Summary
+    line("Executive Summary", 12, True)
+    if not approved:
+        line("No approved findings yet.", 11)
+    for ccell in approved:
+        r = rows[ccell["row_id"]]; row_label = f"{r['type']}:{r['source']}"
+        col_title = cols[ccell["col_id"]]["name"]
+        val = ccell.get("numeric_value")
+        val_str = f" — value: {val:,.2f}" if isinstance(val,(int,float)) else ""
+        line(f"• {col_title} on {row_label}{val_str}", 11)
+        if ccell.get("output_text"):
+            line(f"   {ccell['output_text']}", 10, leading=12)
+        y -= 4
+
+    # Evidence Appendix
+    y -= 4; line("Evidence Appendix", 12, True)
+    for ccell in approved:
+        r = rows[ccell["row_id"]]; row_label = f"{r['type']}:{r['source']}"
+        col_title = cols[ccell["col_id"]]["name"]
+        citations = ccell.get("citations") or []
+        if not citations:
+            line(f"• {col_title} on {row_label}: (no citations captured)", 10)
+            continue
+        line(f"• {col_title} on {row_label}:", 10)
+        for cit in citations[:6]:
+            if cit.get("type") == "pdf":
+                page = cit.get("page","?")
+                snip = (cit.get("excerpt","") or "").replace("\n"," ")
+                line(f"   - PDF p.{page}: “{snip[:120]}”", 9)
+            elif cit.get("type") == "table":
+                sel = cit.get("selector","")
+                line(f"   - CSV selection: {sel}", 9)
+            else:
+                line(f"   - {cit}", 9)
+        y -= 2
+
+    c.showPage(); c.save(); buf.seek(0)
+    return buf.getvalue()
+
+# Compose & download
+left, right = st.columns([1,1])
+with left:
+    if st.button("Compose (show markdown)"):
+        approved = [c for c in SS["grid"]["cells"] if c.get("status") == "approved"]
+        lines = [f"# Investment Memo — {SS['grid']['id']}", "", "## Executive Summary"]
+        for ccell in approved:
+            col = next(x for x in SS["grid"]["columns"] if x["id"]==ccell["col_id"])
+            row = next(x for x in SS["grid"]["rows"] if x["id"]==ccell["row_id"])
+            val = ccell.get("numeric_value")
+            val_s = f"{val:,.2f}" if isinstance(val,(int,float)) else (val or "")
+            lines.append(f"- **{col['name']}** on _{row['row_ref']}_ → {val_s} — {ccell.get('output_text','')}")
+        SS["last_memo_md"] = "\n".join(lines) or "# (no approved findings)"
+        st.code(SS["last_memo_md"], language="markdown")
+
+with right:
+    pdf_bytes = export_memo_pdf_friendly(SS["grid"], SS["grid"]["cells"])
+    st.download_button("📄 Download Investor Memo (clean)",
+                       data=pdf_bytes,
                        file_name=f"TransformAI_Memo_{SS['grid']['id']}.pdf",
                        mime="application/pdf")
 
@@ -673,5 +685,5 @@ if prompt:
                 st.dataframe(h["preview"], use_container_width=True)
 
 # --------------------- ACTIVITY LOG ---------------------
-with st.expander("Activity Log", expanded=False):
+with st.expander("Activity Log (debug)", expanded=False):
     st.json(SS["grid"]["activities"])
