@@ -1,7 +1,7 @@
 # pages/3_Diligence_Grid_Pro.py
 # TransformAI — Diligence Grid (Pro)
-# One-page demo: CSV+PDF evidence → schema mapping → run modules → approve → memo → export → chat
-# No backend required. Safe to later swap modules to FastAPI endpoints.
+# One-page demo: CSV+PDF evidence → schema mapping → run modules (Cohorts, Pricing, PDF KPIs, NRR/GRR)
+# → approve → memo → export → chat. No backend required.
 
 from __future__ import annotations
 import io, uuid, re, textwrap, json
@@ -179,6 +179,110 @@ def module_pricing_power(df: pd.DataFrame,
         figure=fig
     )
 
+# --- NRR/GRR module (NEW) ---
+def module_nrr_grr(df: pd.DataFrame,
+                   customer_col: Optional[str]=None,
+                   ts_col: Optional[str]=None,
+                   revenue_col: Optional[str]=None) -> ModuleResult:
+    """
+    Computes monthly GRR/NRR from revenue by customer.
+    Definitions (per month t vs t-1, among base customers active at t-1):
+      start = revenue at t-1 for base customers
+      churn = revenue from base customers that drop to 0 at t
+      contraction = revenue decrease among base customers who stayed (excl. churn)
+      expansion = revenue increase among base customers who stayed
+      GRR = (start - churn - contraction) / start
+      NRR = (start - churn - contraction + expansion) / start
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ModuleResult({}, "Empty dataset.", [])
+
+    # Infer columns if not provided
+    customer_col = customer_col or _find(df, "customer")
+    ts_col       = ts_col       or _find(df, "date")
+    revenue_col  = revenue_col  or _find(df, "revenue")
+    if not (customer_col and ts_col and revenue_col):
+        return ModuleResult({}, "Need customer/date/revenue columns; map schema first.", [])
+
+    # Normalize to monthly revenue per customer
+    d = df[[customer_col, ts_col, revenue_col]].copy()
+    d[ts_col] = pd.to_datetime(d[ts_col], errors="coerce")
+    d = d.dropna(subset=[customer_col, ts_col, revenue_col])
+    d["month"] = d[ts_col].dt.to_period("M")
+    gp = d.groupby([customer_col, "month"], as_index=False)[revenue_col].sum()
+
+    # Pivot to customers x months
+    pivot = gp.pivot(index=customer_col, columns="month", values=revenue_col).fillna(0.0)
+    pivot = pivot.sort_index(axis=1)  # months ascending
+    months = list(pivot.columns)
+    if len(months) < 2:
+        return ModuleResult({}, "Need at least two months of data.", [])
+
+    labels, grr_list, nrr_list = [], [], []
+    churn_rate, contraction_rate, expansion_rate = [], [], []
+
+    for i in range(1, len(months)):
+        prev_m, curr_m = months[i-1], months[i]
+        prev_rev = pivot[prev_m]
+        curr_rev = pivot[curr_m]
+
+        base_mask = prev_rev > 0
+        start = float(prev_rev[base_mask].sum())
+        if start <= 0:
+            continue
+
+        curr_base = curr_rev[base_mask]
+        # churn: customers with prev>0 and curr==0
+        churn_amt = float(prev_rev[base_mask & (curr_base == 0)].sum())
+        # contraction: drop among those who stayed (excluding churn)
+        contraction_amt = float(((prev_rev[base_mask] - curr_base).clip(lower=0.0).sum()) - churn_amt)
+        contraction_amt = max(contraction_amt, 0.0)
+        # expansion: increase among those who stayed
+        expansion_amt = float((curr_base - prev_rev[base_mask]).clip(lower=0.0).sum())
+
+        grr = (start - churn_amt - contraction_amt) / start if start else np.nan
+        nrr = (start - churn_amt - contraction_amt + expansion_amt) / start if start else np.nan
+
+        labels.append(str(curr_m))
+        grr_list.append(grr)
+        nrr_list.append(nrr)
+        churn_rate.append(churn_amt / start)
+        contraction_rate.append(contraction_amt / start)
+        expansion_rate.append(expansion_amt / start)
+
+    if not labels:
+        return ModuleResult({}, "Insufficient month-to-month overlap to compute retention.", [])
+
+    # Chart
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=labels, y=nrr_list, mode="lines+markers", name="NRR"))
+    fig.add_trace(go.Scatter(x=labels, y=grr_list, mode="lines+markers", name="GRR"))
+    ymax = float(np.nanmax(nrr_list + grr_list)) if len(nrr_list + grr_list) else 1.0
+    fig.update_layout(title="Monthly NRR & GRR (Base customers from prior month)",
+                      xaxis_title="Month", yaxis_title="Rate",
+                      yaxis=dict(range=[0, max(1.2, ymax)]))
+
+    # Latest month KPIs
+    last_label = labels[-1]
+    kpis = {
+        "month": last_label,
+        "grr": float(round(grr_list[-1], 4)),
+        "nrr": float(round(nrr_list[-1], 4)),
+        "churn_rate": float(round(churn_rate[-1], 4)),
+        "contraction_rate": float(round(contraction_rate[-1], 4)),
+        "expansion_rate": float(round(expansion_rate[-1], 4)),
+    }
+
+    narrative = (f"Latest ({last_label}): GRR {kpis['grr']:.0%}, NRR {kpis['nrr']:.0%} "
+                 f"(expansion {kpis['expansion_rate']:.0%}, contraction {kpis['contraction_rate']:.0%}, churn {kpis['churn_rate']:.0%}).")
+
+    return ModuleResult(
+        kpis=kpis,
+        narrative=narrative,
+        citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue by customer"}],
+        figure=fig
+    )
+
 # --- PDF KPI extraction (regex-y, page-cited) ---
 _money = re.compile(r"\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:billion|bn|million|m)?", re.I)
 _pct   = re.compile(r"\d{1,3}(?:\.\d+)?\s*%")
@@ -245,6 +349,7 @@ MODULES = {
     "cohort_retention": {"title":"Cohort Retention (CSV)", "fn": module_cohort_retention, "needs": ["customer","date"], "optional": ["revenue"]},
     "pricing_power":   {"title":"Pricing Power (CSV)",   "fn": module_pricing_power,   "needs": ["price","quantity"], "optional": []},
     "pdf_kpi_extract": {"title":"PDF KPI Extract",       "fn": module_pdf_kpi,          "needs": [], "optional": []},
+    "nrr_grr":         {"title":"NRR/GRR (CSV)",         "fn": module_nrr_grr,          "needs": ["customer","date","revenue"], "optional": []},
 }
 
 # --------------------- 1) EVIDENCE SOURCES ---------------------
@@ -362,6 +467,8 @@ def _run_cell(cell: Dict[str,Any]):
             res = module_cohort_retention(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
         elif col["tool"] == "pricing_power":
             res = module_pricing_power(df, mapping.get("price"), mapping.get("quantity"))
+        elif col["tool"] == "nrr_grr":
+            res = module_nrr_grr(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
         elif col["tool"] == "pdf_kpi_extract":
             res = ModuleResult({}, "PDF module requires a PDF row.", [])
         else:
@@ -370,7 +477,7 @@ def _run_cell(cell: Dict[str,Any]):
         pages = SS["docs"].get(row["source"], [])
         if col["tool"] == "pdf_kpi_extract":
             res = module_pdf_kpi(pages)
-        elif col["tool"] in ("cohort_retention","pricing_power"):
+        elif col["tool"] in ("cohort_retention","pricing_power","nrr_grr"):
             res = ModuleResult({}, f"{col['tool']} applies to CSV rows.", [])
         else:
             res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
@@ -529,7 +636,7 @@ for role, content in SS["chat_history"]:
     with st.chat_message(role):
         st.markdown(content)
 
-prompt = st.chat_input("Ask about your evidence (e.g., 'show EBITDA', 'pages about churn', 'which CSV has price?')")
+prompt = st.chat_input("Ask about your evidence (e.g., 'show EBITDA', 'pages about churn', 'which CSV has price?' )")
 if prompt:
     SS["chat_history"].append(("user", prompt))
     with st.chat_message("user"): st.markdown(prompt)
@@ -568,5 +675,3 @@ if prompt:
 # --------------------- ACTIVITY LOG ---------------------
 with st.expander("Activity Log", expanded=False):
     st.json(SS["grid"]["activities"])
-
-
