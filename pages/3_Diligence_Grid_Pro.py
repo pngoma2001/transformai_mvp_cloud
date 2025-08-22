@@ -1,10 +1,13 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro) — Sprint B
+# TransformAI — Diligence Grid (Pro)
+# Sprint-B features:
 # - Cohort curve + heatmap
 # - NRR/GRR lines + latest-month waterfall
 # - Pricing segmentation + revenue simulator
 # - Evidence Chat (filter All/PDFs/CSVs)
-# - FIX: no default= while also using st.session_state (removes yellow warning)
+# - Memo export with cross-checks (PDF vs CSV)
+# - Manage rows/columns (delete, reorder)
+# - FIX: clear-selection uses a flag before widgets (no Streamlit crash)
 
 from __future__ import annotations
 import io, uuid, re, textwrap, json
@@ -22,11 +25,11 @@ from reportlab.lib.units import inch
 
 # Optional PDF parsing
 try:
-    from pypdf import PdfReader  # pip install pypdf>=4
+    from pypdf import PdfReader
 except Exception:
     PdfReader = None
 
-# ------------- PAGE SETUP -------------
+# -------------------- PAGE SETUP --------------------
 st.set_page_config(page_title="TransformAI — Diligence (Pro)", layout="wide")
 st.title("Transform AI — Diligence Grid (Pro)")
 st.caption("Upload CSV/PDF → map schema → run Cohorts, Pricing, NRR/GRR, PDF KPIs → approve → Export Investor Memo (with cross-checks).")
@@ -36,8 +39,9 @@ SS.setdefault("tables", {})          # CSV name -> DataFrame
 SS.setdefault("docs", {})            # PDF name -> list[page_text]
 SS.setdefault("schema_map", {})      # CSV schema mapping
 SS.setdefault("chat_history", [])    # chat transcript
-SS.setdefault("sel_rows", [])        # selection state (no default= on widgets)
+SS.setdefault("sel_rows", [])        # widget-backed selections
 SS.setdefault("sel_cols", [])
+SS.setdefault("do_clear_selection", False)  # gate for clearing selection BEFORE widgets
 SS.setdefault("grid", {
     "id": f"grid_{uuid.uuid4().hex[:6]}",
     "rows": [],                      # [{id,row_ref,source,type,alias?}]
@@ -46,7 +50,7 @@ SS.setdefault("grid", {
     "activities": []                 # audit log
 })
 
-# ------------- UTILS -------------
+# -------------------- UTILS --------------------
 def _log(action:str, detail:str=""):
     SS["grid"]["activities"].append({"id": uuid.uuid4().hex, "action": action, "detail": detail})
 
@@ -63,7 +67,6 @@ def _fmt_pct(x: Optional[float]) -> str:
     return f"{x*100:.1f}%"
 
 def _find(df: pd.DataFrame, key: str) -> Optional[str]:
-    # heuristic schema finder
     candidates = {
         "customer": ["customer","user","buyer","account","client","cust","cust_id","customer_id"],
         "date":     ["date","timestamp","order_date","created_at","period","month"],
@@ -81,7 +84,7 @@ def _find(df: pd.DataFrame, key: str) -> Optional[str]:
             if needle in c.lower(): return c
     return None
 
-# ------------- GRID HELPERS -------------
+# -------------------- GRID HELPERS --------------------
 def _add_row_from_table(name:str):
     rid = _new_id("row")
     SS["grid"]["rows"].append({"id": rid, "row_ref": f"table:{name}", "source": name, "type": "table", "alias": f"{name} (Transactions)"})
@@ -133,7 +136,7 @@ def move_col(col_id: str, direction: str):
     if direction=="down" and idx < len(cols)-1: cols[idx+1], cols[idx] = cols[idx], cols[idx+1]
     _log("COLUMN_MOVED", f"{col_id}:{direction}")
 
-# ------------- MODULES -------------
+# -------------------- MODULES --------------------
 @dataclass
 class ModuleResult:
     kpis: Dict[str, Any]
@@ -171,6 +174,7 @@ def module_cohort_retention(df: pd.DataFrame,
     if revenue_col and revenue_col in d.columns:
         rev = d.groupby([customer_col, d[ts_col].dt.to_period("M")])[revenue_col].sum().groupby(customer_col).sum()
         ltv_12 = float(round(float(rev.mean()), 2))
+
     fig_curve = px.line(x=list(curve.index), y=list(curve.values),
                         labels={"x":"Months since first purchase","y":"Retention"},
                         title="Average Retention Curve")
@@ -420,7 +424,7 @@ MODULES = {
     "pdf_kpi_extract": {"title":"PDF KPI Extract",       "fn": module_pdf_kpi,         "needs": [], "optional": []},
 }
 
-# ------------- 1) EVIDENCE SOURCES -------------
+# -------------------- 1) EVIDENCE SOURCES --------------------
 st.subheader("1) Evidence Sources")
 c_csv, c_pdf = st.columns(2)
 
@@ -454,7 +458,7 @@ with c_pdf:
             _log("SOURCE_ADDED", f"pdf:{f.name}")
             st.success(f"Loaded PDF: {f.name} ({len(pages)} pages)")
 
-# ------------- 2) MAP CSV SCHEMA -------------
+# -------------------- 2) MAP CSV SCHEMA --------------------
 with st.expander("2) Map CSV Schema", expanded=False):
     def _auto_guess(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         return {
@@ -495,7 +499,7 @@ with st.expander("2) Map CSV Schema", expanded=False):
             _log("SCHEMA_SAVED", name)
             st.success("Saved.")
 
-# ------------- 3) BUILD GRID -------------
+# -------------------- 3) BUILD GRID --------------------
 st.subheader("3) Build Grid")
 b1,b2,b3 = st.columns(3)
 with b1:
@@ -518,7 +522,7 @@ with b3:
 
 col_name = st.text_input("Column label", value="PDF KPIs")
 tool_key = st.selectbox("Module", options=list(MODULES.keys()), format_func=lambda k: MODULES[k]["title"])
-c_add1, c_add2 = st.columns([0.2, 0.8])
+c_add1, _ = st.columns([0.25, 0.75])
 with c_add1:
     if st.button("Add Column"):
         _add_column(col_name, tool_key, params={})
@@ -528,35 +532,37 @@ with c_add1:
 with st.expander("Manage rows & columns", expanded=False):
     st.markdown("**Rows**")
     for r in list(SS["grid"]["rows"]):
-        cols = st.columns([0.58, 0.32, 0.05, 0.05])
+        cols = st.columns([0.58, 0.32, 0.10])
         with cols[0]:
             r["alias"] = st.text_input(f"Alias for {r['row_ref']}", r.get("alias", r["row_ref"]), key=f"alias_{r['id']}")
         with cols[1]:
             st.caption(r["row_ref"])
         with cols[2]:
-            if st.button("🗑️", key=f"delrow_{r['id']}"):
+            if st.button("🗑️ Delete", key=f"delrow_{r['id']}"):
                 delete_row(r["id"])
                 try: st.rerun()
                 except: st.experimental_rerun()
-        with cols[3]:
-            st.caption("")  # spacing
 
     st.markdown("---")
     st.markdown("**Columns**")
     for c in list(SS["grid"]["columns"]):
-        cols = st.columns([0.6, 0.12, 0.12, 0.08, 0.08])
+        cols = st.columns([0.50, 0.12, 0.12, 0.12, 0.14])
         with cols[0]:
             c["name"] = st.text_input(f"Column label ({c['tool']})", c["name"], key=f"colname_{c['id']}")
         with cols[1]:
-            if st.button("⬆️", key=f"up_{c['id']}"): move_col(c["id"], "up"); 
-            # delayed rerun
-            if st.session_state.get(f"up_{c['id']}_clicked", False): pass
+            if st.button("⬆️ Up", key=f"up_{c['id']}"):
+                move_col(c["id"], "up")
+                try: st.rerun()
+                except: st.experimental_rerun()
         with cols[2]:
-            if st.button("⬇️", key=f"dn_{c['id']}"): move_col(c["id"], "down"); 
+            if st.button("⬇️ Down", key=f"dn_{c['id']}"):
+                move_col(c["id"], "down")
+                try: st.rerun()
+                except: st.experimental_rerun()
         with cols[3]:
             st.caption(c["tool"])
         with cols[4]:
-            if st.button("🗑️", key=f"delcol_{c['id']}"):
+            if st.button("🗑️ Delete", key=f"delcol_{c['id']}"):
                 delete_col(c["id"])
                 try: st.rerun()
                 except: st.experimental_rerun()
@@ -565,17 +571,22 @@ with st.expander("Plan (debug)", expanded=False):
     st.write("Rows:", SS["grid"]["rows"])
     st.write("Columns:", SS["grid"]["columns"])
 
-# ------------- 4) RUN CELLS -------------
+# -------------------- 4) RUN CELLS --------------------
 st.subheader("4) Run Cells")
 
-# Widgets use session_state as single source of truth (no default=)
+# Clear-selection gate (MUST run BEFORE widgets are created)
+if SS.get("do_clear_selection"):
+    SS["sel_rows"] = []
+    SS["sel_cols"] = []
+    SS["do_clear_selection"] = False
+
+# Widgets use session_state as the single source of truth (no default= passed)
 sel_rows = st.multiselect(
     "Rows to run",
     options=[r["id"] for r in SS["grid"]["rows"]],
     format_func=lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid),
     key="sel_rows"
 )
-
 sel_cols = st.multiselect(
     "Columns to run",
     options=[c["id"] for c in SS["grid"]["columns"]],
@@ -642,13 +653,15 @@ with r2:
         st.success(f"Ran {len(SS['grid']['cells'])} cell(s).")
 
 with r3:
-    if st.button("Clear selection"):
-        st.session_state.sel_rows = []
-        st.session_state.sel_cols = []
-        try: st.rerun()
-        except: st.experimental_rerun()
+    def _request_clear():
+        st.session_state["do_clear_selection"] = True
+        try:
+            st.rerun()  # Streamlit ≥ 1.36
+        except:
+            st.experimental_rerun()
+    st.button("Clear selection", on_click=_request_clear)
 
-# ------------- 4.1 RESULTS TABLE -------------
+# -------------------- 4.1 RESULTS TABLE --------------------
 st.subheader("4.1 Results (investor view)")
 if SS["grid"]["cells"]:
     grid = SS["grid"]
@@ -670,7 +683,7 @@ if SS["grid"]["cells"]:
 else:
     st.info("No cells yet. Add rows & a column, then run.")
 
-# ------------- 5) REVIEW -------------
+# -------------------- 5) REVIEW --------------------
 st.subheader("5) Review")
 sel_cell_id = st.selectbox("Choose a cell", options=[c["id"] for c in SS["grid"]["cells"]], index=0 if SS["grid"]["cells"] else None)
 if sel_cell_id:
@@ -726,7 +739,7 @@ if sel_cell_id:
         if st.button("Mark Needs-Review"):
             cell["status"] = "needs_review"; _log("CELL_MARK_REVIEW", sel_cell_id); st.warning("Marked.")
 
-# ------------- 6) MEMO + CROSS-CHECKS -------------
+# -------------------- 6) MEMO + CROSS-CHECKS --------------------
 st.subheader("6) Compose Memo & Export (with cross-checks)")
 
 def _csv_revenue_total() -> Optional[float]:
@@ -881,7 +894,7 @@ with right:
                        file_name=f"TransformAI_Memo_{SS['grid']['id']}.pdf",
                        mime="application/pdf")
 
-# ------------- 7) EVIDENCE CHAT (BETA) -------------
+# -------------------- 7) EVIDENCE CHAT (BETA) --------------------
 st.subheader("7) Evidence Chat (beta)")
 scope = st.radio("Search scope", options=["All","PDFs","CSVs"], horizontal=True)
 
@@ -991,7 +1004,6 @@ if prompt:
             if isinstance(h["preview"], pd.DataFrame) and not h["preview"].empty:
                 st.dataframe(h["preview"], use_container_width=True)
 
-# ------------- ACTIVITY LOG -------------
+# -------------------- ACTIVITY LOG --------------------
 with st.expander("Activity Log (debug)", expanded=False):
     st.json(SS["grid"]["activities"])
-
