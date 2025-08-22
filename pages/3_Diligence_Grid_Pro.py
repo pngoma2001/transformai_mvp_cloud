@@ -1,12 +1,10 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro) — Sprint B upgrades
-# New in this version:
-# - Cohort heatmap alongside retention curve
-# - NRR/GRR waterfall (expansion / contraction / churn) for latest month pair
-# - Pricing segmentation: segment-level elasticities + revenue uplift simulator
-# - Evidence Chat filter (All / PDFs / CSVs)
-#
-# Run: streamlit run app.py  → open “Diligence Grid (Pro)”
+# TransformAI — Diligence Grid (Pro) — Sprint B
+# - Cohort curve + heatmap
+# - NRR/GRR lines + latest-month waterfall
+# - Pricing segmentation + revenue simulator
+# - Evidence Chat (filter All/PDFs/CSVs)
+# - FIX: no default= while also using st.session_state (removes yellow warning)
 
 from __future__ import annotations
 import io, uuid, re, textwrap, json
@@ -28,7 +26,7 @@ try:
 except Exception:
     PdfReader = None
 
-# --------------------- PAGE SETUP ---------------------
+# ------------- PAGE SETUP -------------
 st.set_page_config(page_title="TransformAI — Diligence (Pro)", layout="wide")
 st.title("Transform AI — Diligence Grid (Pro)")
 st.caption("Upload CSV/PDF → map schema → run Cohorts, Pricing, NRR/GRR, PDF KPIs → approve → Export Investor Memo (with cross-checks).")
@@ -38,7 +36,7 @@ SS.setdefault("tables", {})          # CSV name -> DataFrame
 SS.setdefault("docs", {})            # PDF name -> list[page_text]
 SS.setdefault("schema_map", {})      # CSV schema mapping
 SS.setdefault("chat_history", [])    # chat transcript
-SS.setdefault("sel_rows", [])        # UI selection memory
+SS.setdefault("sel_rows", [])        # selection state (no default= on widgets)
 SS.setdefault("sel_cols", [])
 SS.setdefault("grid", {
     "id": f"grid_{uuid.uuid4().hex[:6]}",
@@ -48,7 +46,7 @@ SS.setdefault("grid", {
     "activities": []                 # audit log
 })
 
-# --------------------- UTILS ---------------------
+# ------------- UTILS -------------
 def _log(action:str, detail:str=""):
     SS["grid"]["activities"].append({"id": uuid.uuid4().hex, "action": action, "detail": detail})
 
@@ -83,7 +81,7 @@ def _find(df: pd.DataFrame, key: str) -> Optional[str]:
             if needle in c.lower(): return c
     return None
 
-# --------------------- GRID HELPERS ---------------------
+# ------------- GRID HELPERS -------------
 def _add_row_from_table(name:str):
     rid = _new_id("row")
     SS["grid"]["rows"].append({"id": rid, "row_ref": f"table:{name}", "source": name, "type": "table", "alias": f"{name} (Transactions)"})
@@ -114,7 +112,7 @@ def _ensure_cells():
                     "numeric_value": None, "units": None,
                     "kpis": {}, "citations": [],
                     "confidence": None, "notes": [],
-                    "figure": None, "figure2": None  # NEW: second figure slot
+                    "figure": None, "figure2": None
                 })
 
 def delete_row(row_id: str):
@@ -135,7 +133,7 @@ def move_col(col_id: str, direction: str):
     if direction=="down" and idx < len(cols)-1: cols[idx+1], cols[idx] = cols[idx], cols[idx+1]
     _log("COLUMN_MOVED", f"{col_id}:{direction}")
 
-# --------------------- MODULES ---------------------
+# ------------- MODULES -------------
 @dataclass
 class ModuleResult:
     kpis: Dict[str, Any]
@@ -143,9 +141,9 @@ class ModuleResult:
     citations: List[Dict[str, Any]]
     figure: Optional[Any] = None
     units_hint: Optional[str] = None  # "pct" or "money" or None
-    figure2: Optional[Any] = None     # NEW: extra visualization
+    figure2: Optional[Any] = None
 
-# Cohort Retention (CSV) — now with heatmap
+# Cohort Retention (CSV) — curve + heatmap
 def module_cohort_retention(df: pd.DataFrame,
                             customer_col: Optional[str]=None,
                             ts_col: Optional[str]=None,
@@ -167,7 +165,6 @@ def module_cohort_retention(df: pd.DataFrame,
     active = d.groupby(["first_month", "age"])[customer_col].nunique()
     mat = (active / cohort_sizes).unstack(fill_value=0).sort_index()
 
-    # Curve
     curve = mat.mean(axis=0) if not mat.empty else pd.Series(dtype=float)
     m3 = float(round(curve.get(3, np.nan), 4)) if not curve.empty else np.nan
     ltv_12 = None
@@ -178,9 +175,7 @@ def module_cohort_retention(df: pd.DataFrame,
                         labels={"x":"Months since first purchase","y":"Retention"},
                         title="Average Retention Curve")
 
-    # Heatmap
     if not mat.empty:
-        # Convert PeriodIndex to strings for axes
         hm = mat.copy()
         hm.index = hm.index.astype(str)
         hm.columns = [int(c) for c in hm.columns]
@@ -205,10 +200,9 @@ def module_cohort_retention(df: pd.DataFrame,
         figure2=fig_heat
     )
 
-# Pricing Power (CSV) — now with segmentation & bar chart
+# Pricing Power (CSV) — segmentation + bar chart
 def _guess_segment_col(df: pd.DataFrame) -> Optional[str]:
-    cand = _find(df, "segment")
-    return cand
+    return _find(df, "segment")
 
 def _ols_loglog(x: np.ndarray, y: np.ndarray) -> Tuple[float,float,Optional[float]]:
     X = np.log(x); Y = np.log(y)
@@ -234,7 +228,6 @@ def module_pricing_power(df: pd.DataFrame,
     if len(d) < 8:
         return ModuleResult({}, "Need ≥ 8 observations for elasticity regression.", [])
 
-    # Global elasticity
     beta, intercept, r2 = _ols_loglog(d[price_col].values, d[qty_col].values)
     fig_scatter = px.scatter(d, x=price_col, y=qty_col, title="Price vs Quantity")
     xs = np.linspace(float(d[price_col].min()), float(d[price_col].max()), 60)
@@ -243,7 +236,6 @@ def module_pricing_power(df: pd.DataFrame,
     narrative = f"Own-price elasticity ≈ {beta:.2f} (R²={r2:.2f}). "
     narrative += "Inelastic (|ε|<1)." if abs(beta) < 1 else "Elastic (|ε|≥1)."
 
-    # Segment elasticities (auto-guess)
     seg_col = _guess_segment_col(d)
     seg_results = []
     fig_segments = None
@@ -273,7 +265,7 @@ def module_pricing_power(df: pd.DataFrame,
         figure2=fig_segments
     )
 
-# NRR/GRR (CSV) — now with waterfall for latest month pair
+# NRR/GRR (CSV) — lines + latest waterfall
 def module_nrr_grr(df: pd.DataFrame,
                    customer_col: Optional[str]=None,
                    ts_col: Optional[str]=None,
@@ -318,7 +310,6 @@ def module_nrr_grr(df: pd.DataFrame,
 
     if not labels: return ModuleResult({}, "Insufficient overlap to compute NRR/GRR.", [], units_hint="pct")
 
-    # Lines
     fig_lines = go.Figure()
     fig_lines.add_trace(go.Scatter(x=labels, y=nrr_list, mode="lines+markers", name="NRR"))
     fig_lines.add_trace(go.Scatter(x=labels, y=grr_list, mode="lines+markers", name="GRR"))
@@ -327,7 +318,6 @@ def module_nrr_grr(df: pd.DataFrame,
                             xaxis_title="Month", yaxis_title="Rate",
                             yaxis=dict(range=[0, max(1.2, ymax)]))
 
-    # Waterfall for latest month pair
     fig_wf = None
     if last_pair:
         pm, cm, start, churn_amt, contr_amt, exp_amt = last_pair
@@ -430,7 +420,7 @@ MODULES = {
     "pdf_kpi_extract": {"title":"PDF KPI Extract",       "fn": module_pdf_kpi,         "needs": [], "optional": []},
 }
 
-# --------------------- 1) EVIDENCE SOURCES ---------------------
+# ------------- 1) EVIDENCE SOURCES -------------
 st.subheader("1) Evidence Sources")
 c_csv, c_pdf = st.columns(2)
 
@@ -464,7 +454,7 @@ with c_pdf:
             _log("SOURCE_ADDED", f"pdf:{f.name}")
             st.success(f"Loaded PDF: {f.name} ({len(pages)} pages)")
 
-# --------------------- 2) MAP CSV SCHEMA ---------------------
+# ------------- 2) MAP CSV SCHEMA -------------
 with st.expander("2) Map CSV Schema", expanded=False):
     def _auto_guess(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         return {
@@ -505,7 +495,7 @@ with st.expander("2) Map CSV Schema", expanded=False):
             _log("SCHEMA_SAVED", name)
             st.success("Saved.")
 
-# --------------------- 3) BUILD GRID ---------------------
+# ------------- 3) BUILD GRID -------------
 st.subheader("3) Build Grid")
 b1,b2,b3 = st.columns(3)
 with b1:
@@ -518,13 +508,11 @@ with b2:
         _ensure_cells()
 with b3:
     if st.button("Add Starter Columns (4)"):
-        presets = [
-            ("Cohort Retention", "cohort_retention"),
-            ("Pricing Power", "pricing_power"),
-            ("NRR/GRR", "nrr_grr"),
-            ("PDF KPIs", "pdf_kpi_extract"),
-        ]
-        for name, tool in presets: _add_column(name, tool, {})
+        for name, tool in [("Cohort Retention","cohort_retention"),
+                           ("Pricing Power","pricing_power"),
+                           ("NRR/GRR","nrr_grr"),
+                           ("PDF KPIs","pdf_kpi_extract")]:
+            _add_column(name, tool, {})
         _ensure_cells()
         st.success("Added Cohort Retention, Pricing Power, NRR/GRR, and PDF KPIs.")
 
@@ -547,7 +535,9 @@ with st.expander("Manage rows & columns", expanded=False):
             st.caption(r["row_ref"])
         with cols[2]:
             if st.button("🗑️", key=f"delrow_{r['id']}"):
-                delete_row(r["id"]); st.experimental_rerun()
+                delete_row(r["id"])
+                try: st.rerun()
+                except: st.experimental_rerun()
         with cols[3]:
             st.caption("")  # spacing
 
@@ -558,28 +548,41 @@ with st.expander("Manage rows & columns", expanded=False):
         with cols[0]:
             c["name"] = st.text_input(f"Column label ({c['tool']})", c["name"], key=f"colname_{c['id']}")
         with cols[1]:
-            if st.button("⬆️", key=f"up_{c['id']}"): move_col(c["id"], "up"); st.experimental_rerun()
+            if st.button("⬆️", key=f"up_{c['id']}"): move_col(c["id"], "up"); 
+            # delayed rerun
+            if st.session_state.get(f"up_{c['id']}_clicked", False): pass
         with cols[2]:
-            if st.button("⬇️", key=f"dn_{c['id']}"): move_col(c["id"], "down"); st.experimental_rerun()
+            if st.button("⬇️", key=f"dn_{c['id']}"): move_col(c["id"], "down"); 
         with cols[3]:
             st.caption(c["tool"])
         with cols[4]:
-            if st.button("🗑️", key=f"delcol_{c['id']}"): delete_col(c["id"]); st.experimental_rerun()
+            if st.button("🗑️", key=f"delcol_{c['id']}"):
+                delete_col(c["id"])
+                try: st.rerun()
+                except: st.experimental_rerun()
 
 with st.expander("Plan (debug)", expanded=False):
     st.write("Rows:", SS["grid"]["rows"])
     st.write("Columns:", SS["grid"]["columns"])
 
-# --------------------- 4) RUN CELLS ---------------------
+# ------------- 4) RUN CELLS -------------
 st.subheader("4) Run Cells")
-sel_rows = st.multiselect("Rows to run", options=[r["id"] for r in SS["grid"]["rows"]],
-                          default=SS["sel_rows"],
-                          format_func=lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid),
-                          key="sel_rows")
-sel_cols = st.multiselect("Columns to run", options=[c["id"] for c in SS["grid"]["columns"]],
-                          default=SS["sel_cols"],
-                          format_func=lambda cid: next((c["name"] for c in SS["grid"]["columns"] if c["id"]==cid), cid),
-                          key="sel_cols")
+
+# Widgets use session_state as single source of truth (no default=)
+sel_rows = st.multiselect(
+    "Rows to run",
+    options=[r["id"] for r in SS["grid"]["rows"]],
+    format_func=lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid),
+    key="sel_rows"
+)
+
+sel_cols = st.multiselect(
+    "Columns to run",
+    options=[c["id"] for c in SS["grid"]["columns"]],
+    format_func=lambda cid: next((c["name"] for c in SS["grid"]["columns"] if c["id"]==cid), cid),
+    key="sel_cols"
+)
+
 r1, r2, r3 = st.columns(3)
 
 def _run_cell(cell: Dict[str,Any]):
@@ -609,10 +612,8 @@ def _run_cell(cell: Dict[str,Any]):
         else:
             res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
 
-    # Persist result onto cell
     cell["status"] = "done" if res.kpis else "needs_review"
     cell["output_text"] = res.narrative
-    # choose first numeric for quick glance
     v = None
     if res.kpis:
         for _k,_v in res.kpis.items():
@@ -642,10 +643,12 @@ with r2:
 
 with r3:
     if st.button("Clear selection"):
-        SS["sel_rows"], SS["sel_cols"] = [], []
-        st.experimental_rerun()
+        st.session_state.sel_rows = []
+        st.session_state.sel_cols = []
+        try: st.rerun()
+        except: st.experimental_rerun()
 
-# --------------------- 4.1 INVESTOR RESULTS TABLE ---------------------
+# ------------- 4.1 RESULTS TABLE -------------
 st.subheader("4.1 Results (investor view)")
 if SS["grid"]["cells"]:
     grid = SS["grid"]
@@ -667,7 +670,7 @@ if SS["grid"]["cells"]:
 else:
     st.info("No cells yet. Add rows & a column, then run.")
 
-# --------------------- 5) REVIEW ---------------------
+# ------------- 5) REVIEW -------------
 st.subheader("5) Review")
 sel_cell_id = st.selectbox("Choose a cell", options=[c["id"] for c in SS["grid"]["cells"]], index=0 if SS["grid"]["cells"] else None)
 if sel_cell_id:
@@ -676,7 +679,6 @@ if sel_cell_id:
     row  = next(x for x in SS["grid"]["rows"] if x["id"]==cell["row_id"])
     st.markdown(f"**{col['name']}** on _{row.get('alias') or row['row_ref']}_ — status: `{cell['status']}`")
 
-    # Show figures (now two slots)
     tabs = st.tabs(["Chart 1", "Chart 2", "Details"])
     with tabs[0]:
         if cell.get("figure") is not None:
@@ -695,13 +697,12 @@ if sel_cell_id:
         with st.expander("Citations"):
             st.json(cell.get("citations", []))
 
-    # Pricing simulator if applicable
+    # Pricing simulator
     if next((True for cc in SS["grid"]["columns"] if cc["id"]==cell["col_id"] and cc["tool"]=="pricing_power"), False):
         st.markdown("### 💡 Pricing Uplift Simulator")
         eps = cell.get("kpis", {}).get("elasticity")
         if isinstance(eps, (int,float)):
             pct = st.slider("Proposed average price change (%)", min_value=-30, max_value=30, value=5, step=1)
-            # Simple constant elasticity revenue impact: ΔR/R ≈ (1+Δp)^(1+ε) - 1
             dp = pct/100.0
             rev_change = (1+dp)**(1+eps) - 1
             st.write(f"Estimated revenue change: **{_fmt_pct(rev_change)}** given ε≈{eps:.2f}")
@@ -710,7 +711,7 @@ if sel_cell_id:
         else:
             st.info("Run Pricing Power to compute elasticity first.")
 
-    # NRR/GRR: explain rates
+    # NRR/GRR context
     if next((True for cc in SS["grid"]["columns"] if cc["id"]==cell["col_id"] and cc["tool"]=="nrr_grr"), False):
         k = cell.get("kpis", {})
         if k:
@@ -725,7 +726,7 @@ if sel_cell_id:
         if st.button("Mark Needs-Review"):
             cell["status"] = "needs_review"; _log("CELL_MARK_REVIEW", sel_cell_id); st.warning("Marked.")
 
-# --------------------- 6) MEMO + CROSS-CHECKS ---------------------
+# ------------- 6) MEMO + CROSS-CHECKS -------------
 st.subheader("6) Compose Memo & Export (with cross-checks)")
 
 def _csv_revenue_total() -> Optional[float]:
@@ -760,8 +761,6 @@ def _first_pdf_kpis() -> Dict[str, Any]:
 def _cross_checks() -> List[Tuple[str,str]]:
     checks = []
     pdf_kpis = _first_pdf_kpis()
-
-    # Revenue
     pdf_rev = pdf_kpis.get("revenue")
     csv_rev = _csv_revenue_total()
     if pdf_rev is not None and csv_rev is not None and csv_rev > 0:
@@ -775,7 +774,6 @@ def _cross_checks() -> List[Tuple[str,str]]:
     elif csv_rev is not None:
         checks.append(("Revenue", f"ℹ️ CSV {_fmt_money(csv_rev)} (no PDF revenue to compare)"))
 
-    # Churn
     pdf_churn = pdf_kpis.get("churn")
     csv_churn = _nrr_last_churn()
     if (pdf_churn is not None) and (csv_churn is not None):
@@ -788,7 +786,6 @@ def _cross_checks() -> List[Tuple[str,str]]:
         checks.append(("Churn", f"ℹ️ PDF {_fmt_pct(pdf_churn)} (no CSV churn to compare)"))
     elif csv_churn is not None:
         checks.append(("Churn", f"ℹ️ CSV {_fmt_pct(csv_churn)} (no PDF churn to compare)"))
-
     return checks
 
 def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) -> bytes:
@@ -808,11 +805,9 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
                 c.showPage(); y = H - M; c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
             c.drawString(M, y, seg); y -= leading
 
-    # Header
     line("Transform AI — Investment Memo", 14, True, 16)
     line(f"Grid: {grid.get('id', 'unknown')}", 9); y -= 6
 
-    # Cross-checks
     checks = _cross_checks()
     if checks:
         line("Cross-checks (PDF vs CSV)", 12, True)
@@ -820,15 +815,13 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
             line(f"• {label}: {msg}", 10, leading=12)
         y -= 4
 
-    # Executive Summary
     line("Executive Summary", 12, True)
     if not approved:
         line("No approved findings yet.", 11)
     for ccell in approved:
         r = rows[ccell["row_id"]]; row_label = r.get("alias") or f"{r['type']}:{r['source']}"
         col_title = cols[ccell["col_id"]]["name"]
-        val = ccell.get("numeric_value")
-        units = ccell.get("units")
+        val = ccell.get("numeric_value"); units = ccell.get("units")
         if isinstance(val,(int,float)):
             val_str = _fmt_pct(val) if units=="pct" else (f"{val:,.2f}")
         else:
@@ -838,7 +831,6 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
             line(f"   {ccell['output_text']}", 10, leading=12)
         y -= 4
 
-    # Evidence Appendix
     y -= 4; line("Evidence Appendix", 12, True)
     for ccell in approved:
         r = rows[ccell["row_id"]]; row_label = r.get("alias") or f"{r['type']}:{r['source']}"
@@ -858,7 +850,6 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
                 line(f"   - CSV selection: {sel}", 9)
             else:
                 line(f"   - {cit}", 9)
-        y -= 2
 
     c.showPage(); c.save(); buf.seek(0)
     return buf.getvalue()
@@ -890,7 +881,7 @@ with right:
                        file_name=f"TransformAI_Memo_{SS['grid']['id']}.pdf",
                        mime="application/pdf")
 
-# --------------------- 7) EVIDENCE CHAT (BETA, filtered) ---------------------
+# ------------- 7) EVIDENCE CHAT (BETA) -------------
 st.subheader("7) Evidence Chat (beta)")
 scope = st.radio("Search scope", options=["All","PDFs","CSVs"], horizontal=True)
 
@@ -1000,6 +991,7 @@ if prompt:
             if isinstance(h["preview"], pd.DataFrame) and not h["preview"].empty:
                 st.dataframe(h["preview"], use_container_width=True)
 
-# --------------------- ACTIVITY LOG ---------------------
+# ------------- ACTIVITY LOG -------------
 with st.expander("Activity Log (debug)", expanded=False):
     st.json(SS["grid"]["activities"])
+
