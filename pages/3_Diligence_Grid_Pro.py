@@ -30,7 +30,8 @@ except Exception:
 st.set_page_config(page_title="TransformAI — Diligence Grid (Pro)", layout="wide")
 st.markdown("""
 <style>
-.block-container {max-width: 1600px !important; padding-top: 1.0rem;}
+/* Fill the canvas more aggressively */
+.block-container {max-width: 1800px !important; padding-top: 0.75rem;}
 .stDataFrame [role="checkbox"] {transform: scale(1.0);}
 </style>
 """, unsafe_allow_html=True)
@@ -49,6 +50,7 @@ def ensure_state():
     SS.setdefault("columns", [])              # [{id, label, module}]
     SS.setdefault("matrix", {})               # {row_id: set([module,...])}
 
+    # RESULTS live as {(row_id, col_id): {...}} in-memory
     SS.setdefault("results", {})              # {(row_id, col_id): {...}}
     SS.setdefault("cache_key", {})            # {(row_id, col_id): str}
 
@@ -66,11 +68,43 @@ ensure_state()
 def uid(p="row"): return f"{p}_{uuid.uuid4().hex[:8]}"
 def now_ts(): return int(time.time())
 
+# ----------------------- tuple-safe pack/unpack for results -------------------
+def _pack_results(res: Dict[Tuple[str, str], Any]) -> Dict[str, Any]:
+    """(row_id, col_id) -> 'row_id|col_id' for JSON."""
+    out = {}
+    for k, v in res.items():
+        if isinstance(k, tuple) and len(k) == 2:
+            out[f"{k[0]}|{k[1]}"] = v
+        else:
+            out[str(k)] = v
+    return out
+
+def _unpack_results(d: Dict[str, Any]) -> Dict[Tuple[str, str], Any]:
+    """'row_id|col_id' (or legacy '(rid, cid)') -> (row_id, col_id)."""
+    out: Dict[Tuple[str, str], Any] = {}
+    for ks, v in d.items():
+        if isinstance(ks, str) and "|" in ks:
+            rid, cid = ks.split("|", 1)
+            out[(rid, cid)] = v
+        elif isinstance(ks, str) and ks.startswith("(") and ks.endswith(")"):
+            # legacy fallback; parse safely without builtins
+            try:
+                tup = eval(ks, {"__builtins__": {}}, {})
+                if isinstance(tup, tuple) and len(tup) == 2:
+                    out[(str(tup[0]), str(tup[1]))] = v
+            except Exception:
+                # ignore unparsable keys
+                pass
+        # else: ignore unknown shapes
+    return out
+
+# ----------------------------- snapshots (tuple-safe) -------------------------
 def snapshot_push():
     SS["undo"].append(json.dumps({
-        "rows": SS["rows"], "columns": SS["columns"],
-        "matrix": {k:list(v) for k,v in SS["matrix"].items()},
-        "results": SS["results"],
+        "rows": SS["rows"],
+        "columns": SS["columns"],
+        "matrix": {k: list(v) for k, v in SS["matrix"].items()},  # sets -> lists
+        "results": _pack_results(SS["results"]),                  # tuple keys -> strings
     }, default=str))
     SS["redo"].clear()
 
@@ -78,27 +112,36 @@ def snapshot_apply(snap: str):
     data = json.loads(snap)
     SS["rows"]    = data.get("rows", [])
     SS["columns"] = data.get("columns", [])
-    SS["matrix"]  = {k:set(v) for k,v in data.get("matrix", {}).items()}
-    SS["results"] = {tuple(eval(k) if isinstance(k,str) and k.startswith("(") else k): v
-                     for k,v in data.get("results", {}).items()}
+    SS["matrix"]  = {k: set(v) for k, v in data.get("matrix", {}).items()}
+    SS["results"] = _unpack_results(data.get("results", {}))
 
 def undo():
-    if not SS["undo"]: return
-    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"],
-                      "matrix": {k:list(v) for k,v in SS["matrix"].items()},
-                      "results": SS["results"]}, default=str)
+    if not SS["undo"]:
+        return
+    cur = json.dumps({
+        "rows": SS["rows"],
+        "columns": SS["columns"],
+        "matrix": {k: list(v) for k, v in SS["matrix"].items()},
+        "results": _pack_results(SS["results"]),
+    }, default=str)
     snap = SS["undo"].pop()
     SS["redo"].append(cur)
     snapshot_apply(snap)
+    st.toast("Undone")
 
 def redo():
-    if not SS["redo"]: return
-    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"],
-                      "matrix": {k:list(v) for k,v in SS["matrix"].items()},
-                      "results": SS["results"]}, default=str)
+    if not SS["redo"]:
+        return
+    cur = json.dumps({
+        "rows": SS["rows"],
+        "columns": SS["columns"],
+        "matrix": {k: list(v) for k, v in SS["matrix"].items()},
+        "results": _pack_results(SS["results"]),
+    }, default=str)
     snap = SS["redo"].pop()
     SS["undo"].append(cur)
     snapshot_apply(snap)
+    st.toast("Redone")
 
 # -----------------------------------------------------------------------------
 # Schema helpers
@@ -126,10 +169,11 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
     sch = SS["schema"].get(csv_name, {})
     # rename to canonical
     rename_map = {}
-    for k,v in sch.items():
+    for k, v in sch.items():
         if v and v in df.columns and k not in df.columns:
             rename_map[v] = k
-    if rename_map: df = df.rename(columns=rename_map)
+    if rename_map:
+        df = df.rename(columns=rename_map)
     # derive month
     if "month" not in df.columns and "order_date" in df.columns:
         try:
@@ -146,7 +190,7 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
     if "price" not in df.columns:
         if "revenue" in df.columns and "quantity" in df.columns:
             with np.errstate(divide="ignore", invalid="ignore"):
-                df["price"] = np.where(df["quantity"]>0, df["revenue"]/df["quantity"], np.nan)
+                df["price"] = np.where(df["quantity"] > 0, df["revenue"] / df["quantity"], np.nan)
         else:
             df["price"] = np.nan
     return df
@@ -219,11 +263,14 @@ def _pdf_kpis(_raw: bytes) -> Dict[str, Any]:
 
 def _cohort(df: pd.DataFrame) -> Dict[str, Any]:
     try:
-        if {"customer_id","order_date","amount"}.issubset(df.columns):
+        if {"customer_id","order_date","amount"}.issubset(df.columns) or {"customer_id","order_date","revenue"}.issubset(df.columns):
             d = df.copy()
+            if "amount" in d.columns and "revenue" not in d.columns:
+                d["revenue"] = d["amount"]
             d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
             d = d.dropna(subset=["customer_id","order_date"])
             d["month"] = d["order_date"].dt.to_period("M")
+            # simple demo curve
             curve = [round(max(0.0, 1.0*(0.9**i)), 2) for i in range(6)]
             m3 = curve[3] if len(curve)>3 else None
             return dict(value=m3, curve=curve, summary=f"Retention stabilizes ~M3 at {m3:.0%} (demo).")
@@ -416,8 +463,10 @@ with tab_data:
         csvs = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True)
         if csvs:
             for f in csvs:
-                try: df = pd.read_csv(f)
-                except Exception: df = pd.read_csv(io.BytesIO(f.getvalue()))
+                try:
+                    df = pd.read_csv(f)
+                except Exception:
+                    df = pd.read_csv(io.BytesIO(f.getvalue()))
                 SS["csv_files"][f.name] = df
                 SS["schema"].setdefault(f.name, _auto_guess_schema(df))
             st.success(f"Loaded {len(csvs)} CSV file(s).")
@@ -468,10 +517,9 @@ with tab_grid:
             add_template_columns(QOE_TEMPLATE); st.toast("QoE columns added")
     with a4:
         if st.button("Undo", use_container_width=True):
-            if SS["undo"]: undo(); st.toast("Undone")
-
+            undo()
     if st.button("Redo", use_container_width=True):
-        if SS["redo"]: redo(); st.toast("Redone")
+        redo()
 
     # Inline rows
     st.markdown("**Rows**")
@@ -595,210 +643,4 @@ with tab_run:
         options = []
         for r in rows:
             sel = SS["matrix"].get(r["id"], set())
-            for mod in sel:
-                cid = by_mod.get(mod)
-                if cid:
-                    options.append((r["id"], cid, f"{r['alias']} → {mod}"))
-        if options:
-            labels = [o[2] for o in options]
-            picks = st.multiselect("Pick cell pairs to run", options=list(range(len(options))), default=list(range(len(options)))[:8], format_func=lambda i: labels[i])
-            if st.button("Queue + Run selection"):
-                pairs = [(options[i][0], options[i][1]) for i in picks]
-                enqueue_pairs(pairs, respect_cache=True)
-                run_queued_jobs()
-                st.success(f"Ran {len(pairs)} cell(s).")
-        else:
-            st.info("No mapped pairs in Matrix yet.")
 
-    # Job table
-    if SS["jobs"]:
-        rows_by_id = {r["id"]: r for r in SS["rows"]}
-        cols_by_id = {c["id"]: c for c in SS["columns"]}
-        out=[]
-        for j in SS["jobs"]:
-            r=rows_by_id.get(j["rid"],{"alias":"(deleted)"})
-            c=cols_by_id.get(j["cid"],{"label":"(deleted)"})
-            out.append(dict(Row=r["alias"], Column=c["label"], Status=j["status"], Started=j["started"], Ended=j["ended"], Note=j.get("note","")))
-        st.dataframe(pd.DataFrame(out), hide_index=True, use_container_width=True)
-    else:
-        st.info("No jobs yet.")
-
-# ---------------------- SHEET (agentic) --------------------
-def _status_emoji(s: Optional[str]) -> str:
-    return {
-        "done":"✅","cached":"🟢","queued":"⏳","running":"🟡",
-        "error":"🔴","needs_review":"🟠"
-    }.get(s or "", "•")
-
-with tab_sheet:
-    st.subheader("Sheet — Agentic Spreadsheet")
-    rows = SS["rows"]; cols = SS["columns"]
-    if not rows or not cols:
-        st.info("Add rows & columns first.")
-    else:
-        rows_by_id = {r["id"]: r for r in rows}
-        cols_by_id = {c["id"]: c for c in cols}
-
-        # Build display matrix (rows=aliases, columns=column labels)
-        aliases = [r["alias"] for r in rows]
-        labels  = [c["label"] for c in cols]
-        matrix_df = pd.DataFrame(index=aliases, columns=labels)
-        for r in rows:
-            sel = SS["matrix"].get(r["id"], set())
-            for c in cols:
-                cell_text = "—"
-                mapped = (c["module"] in sel)
-                if mapped:
-                    res = SS["results"].get((r["id"], c["id"]))
-                    if res:
-                        val = res.get("value")
-                        val_txt = ""
-                        if isinstance(val,(int,float)) and pd.notna(val):
-                            # keep short
-                            val_txt = f" {val:.2f}"
-                        cell_text = f"{_status_emoji(res.get('status'))}{val_txt}"
-                    else:
-                        cell_text = "•"
-                matrix_df.at[r["alias"], c["label"]] = cell_text
-
-        st.caption("Legend: ✅ done, 🟢 cached, ⏳ queued, 🟡 running, 🟠 needs review, 🔴 error, • mapped/no result, — not mapped")
-        st.dataframe(matrix_df.fillna("—"), use_container_width=True, height=420)
-
-        st.markdown("**Cell controls**")
-        c1,c2,c3,c4 = st.columns([2,2,1,1])
-        with c1:
-            sel_row = st.selectbox("Row", aliases)
-        with c2:
-            sel_col = st.selectbox("Column", labels)
-        # resolve ids
-        rid = next(r["id"] for r in rows if r["alias"]==sel_row)
-        cid = next(c["id"] for c in cols if c["label"]==sel_col)
-
-        c_left, c_mid, c_right = st.columns([1,1,2])
-        with c_left:
-            if st.button("▶️ Run cell", use_container_width=True):
-                enqueue_pairs([(rid,cid)], respect_cache=True)
-                run_queued_jobs()
-                st.success("Cell executed.")
-        with c_mid:
-            if st.button("↻ Retry cell", use_container_width=True):
-                retry_cell(rid,cid); run_queued_jobs(); st.success("Retried.")
-        with c_right:
-            a,b = st.columns(2)
-            with a:
-                if st.button("Mark needs_review", use_container_width=True):
-                    SS["results"].setdefault((rid,cid),{}); SS["results"][(rid,cid)]["status"]="needs_review"; st.toast("Marked.")
-            with b:
-                if st.button("Clear needs_review", use_container_width=True):
-                    if SS["results"].get((rid,cid),{}).get("status")=="needs_review":
-                        SS["results"][(rid,cid)]["status"]="done"; st.toast("Cleared.")
-
-        st.markdown("**Batch controls**")
-        b1,b2,b3 = st.columns([1,1,2])
-        # Run entire row (mapped cols)
-        if b1.button("Run row (mapped)", use_container_width=True):
-            sel = SS["matrix"].get(rid, set())
-            pairs = [(rid, c["id"]) for c in cols if c["module"] in sel]
-            enqueue_pairs(pairs, respect_cache=True); run_queued_jobs()
-            st.success(f"Ran {len(pairs)} cell(s) for row.")
-        # Run entire column (mapped rows)
-        if b2.button("Run column (mapped)", use_container_width=True):
-            mod = next(c["module"] for c in cols if c["id"]==cid)
-            pairs=[]
-            for r in rows:
-                if mod in SS["matrix"].get(r["id"], set()):
-                    pairs.append((r["id"], cid))
-            enqueue_pairs(pairs, respect_cache=True); run_queued_jobs()
-            st.success(f"Ran {len(pairs)} cell(s) for column.")
-        # Run all uncomputed (mapped)
-        if b3.button("Run all (mapped & uncomputed)", use_container_width=True):
-            pairs=[]
-            for r in rows:
-                sel = SS["matrix"].get(r["id"], set())
-                for c in cols:
-                    if c["module"] in sel:
-                        res = SS["results"].get((r["id"], c["id"]))
-                        if not res or res.get("status") not in {"done","cached","needs_review"}:
-                            pairs.append((r["id"], c["id"]))
-            enqueue_pairs(pairs, respect_cache=True); run_queued_jobs()
-            st.success(f"Ran {len(pairs)} cell(s).")
-
-# -------------------------- REVIEW --------------------------
-with tab_review:
-    st.subheader("Review — inspect a single cell with charts & what-ifs")
-
-    if not SS["results"]:
-        st.info("No results yet.")
-    else:
-        rows_by_id = {r["id"]: r for r in SS["rows"]}
-        cols_by_id = {c["id"]: c for c in SS["columns"]}
-        keys = list(SS["results"].keys())
-        labels=[]
-        for (rid,cid) in keys:
-            r=rows_by_id.get(rid,{"alias":rid}); c=cols_by_id.get(cid,{"label":cid,"module":"?"})
-            status=SS["results"][(rid,cid)].get("status")
-            emoji={"done":"✅","cached":"🟢","queued":"⏳","running":"🟡","error":"🔴","needs_review":"🟠"}.get(status,"•")
-            labels.append(f"{emoji} {r['alias']} → {c['label']} ({c['module']})")
-        idx = st.selectbox("Pick result", list(range(len(keys))), index=0, format_func=lambda i: labels[i])
-        rid,cid = keys[idx]
-        res = SS["results"].get((rid,cid),{})
-        col_def = cols_by_id.get(cid,{}); row_def = rows_by_id.get(rid,{})
-
-        st.write("**Status**:", res.get("status"))
-        st.write("**Summary**:", res.get("summary") or "—")
-
-        # Charts
-        if col_def.get("module") == "Cohort Retention (CSV)" and "curve" in res:
-            curve = res["curve"]
-            if PLOTLY_OK:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=list(range(len(curve))), y=curve, mode="lines+markers", name="Retention"))
-                fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.line_chart(pd.DataFrame({"x":range(len(curve)),"y":curve}).set_index("x"))
-
-        if col_def.get("module") == "Pricing Power (CSV)" and "scatter" in res and PLOTLY_OK:
-            sc = res["scatter"]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=sc["x"], y=sc["y"], mode="markers", name="log(q) vs log(p)"))
-            fig.add_trace(go.Scatter(x=sc["x"], y=sc["fit"], mode="lines", name="fit"))
-            fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10), xaxis_title="log(price)", yaxis_title="log(quantity)")
-            st.plotly_chart(fig, use_container_width=True)
-
-        if col_def.get("module") == "NRR/GRR (CSV)" and "series" in res and PLOTLY_OK:
-            s = res["series"]
-            fig = make_subplots(rows=1, cols=1)
-            fig.add_trace(go.Bar(x=[r["month"] for r in s], y=[r["grr"] for r in s], name="GRR"))
-            fig.add_trace(go.Scatter(x=[r["month"] for r in s], y=[r["nrr"] for r in s], mode="lines+markers", name="NRR"))
-            fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10), yaxis_tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
-
-        if col_def.get("module") == "Unit Economics (CSV)":
-            st.markdown("**What-ifs**")
-            c1,c2 = st.columns(2)
-            with c1:
-                SS["whatif_gm"] = st.slider("Gross Margin %", 0.2, 0.9, SS.get("whatif_gm",0.62), 0.01)
-            with c2:
-                SS["whatif_cac"] = st.slider("CAC ($)", 0.0, 200.0, SS.get("whatif_cac",42.0), 1.0)
-            df = materialize_df(row_def["source"]) if row_def.get("row_type")=="table" else pd.DataFrame()
-            k = _unit_econ(df, gm=SS["whatif_gm"], cac=SS["whatif_cac"])
-            st.info(f"What-if → {k['summary']}")
-            if PLOTLY_OK:
-                fig = go.Figure()
-                fig.add_trace(go.Bar(x=["AOV","CAC","CM"], y=[k["aov"], k["cac"], k["cm"]]))
-                fig.update_layout(height=280, margin=dict(l=10,r=10,t=30,b=10))
-                st.plotly_chart(fig, use_container_width=True)
-
-# --------------------------- MEMO ---------------------------
-with tab_memo:
-    st.subheader("Memo / Export")
-    if SS["results"]:
-        st.download_button("Download Results (CSV)", export_results_csv(), file_name="transformai_results.csv", mime="text/csv")
-        if REPORTLAB_OK:
-            try:
-                st.download_button("Download QoE Summary (PDF)", export_results_pdf(), file_name="TransformAI_QoE_Summary.pdf", mime="application/pdf")
-            except Exception as e:
-                st.warning(f"PDF export unavailable: {e}")
-    else:
-        st.info("Run some cells to export.")
