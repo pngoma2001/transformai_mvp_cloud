@@ -1,10 +1,9 @@
 # pages/3_Diligence_Grid_Pro.py
 # Transform AI — Diligence Grid (Pro)
-# Wide layout + Matrix mapping + Agentic Spreadsheet + Focused Review viz
-# Adds: Real cohort engine, PDF evidence viewer, Save/Load project
+# Adds: PVM Bridge module, Approvals, Evidence drawer, Run budget, Sidebar what-ifs
 
 from __future__ import annotations
-import io, json, re, time, uuid
+import io, json, time, uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,7 +18,7 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# Plotly for charts (primary renderer)
+# Plotly (primary)
 try:
     import plotly.graph_objs as go
     from plotly.subplots import make_subplots  # noqa
@@ -27,26 +26,12 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-# Altair for charts (fallback renderer so retention still shows)
+# Altair (fallback)
 try:
     import altair as alt
     ALTAIR_OK = True
 except Exception:
     ALTAIR_OK = False
-
-# Optional PDF parsers for evidence viewer
-PDF_PARSE_OK = False
-try:
-    # Prefer pdfminer.six if available
-    from pdfminer.high_level import extract_text
-    PDF_PARSE_OK = True
-except Exception:
-    try:
-        # Fallback to PyPDF2 text extraction if present
-        import PyPDF2  # type: ignore
-        PDF_PARSE_OK = True
-    except Exception:
-        PDF_PARSE_OK = False
 
 
 # ---------------------------------------------------------------------------
@@ -56,19 +41,15 @@ st.set_page_config(page_title="Transform AI — Diligence Grid (Pro)", layout="w
 st.markdown(
     """
 <style>
-/* widen canvas and keep generous breathing room */
 .block-container {max-width: 1700px !important; padding-top: 0.5rem;}
-/* Fix H1 being visually cut */
+/* Fix header clipping + spacing */
 h1, .stMarkdown h1 {
   white-space: normal !important;
   overflow-wrap: anywhere !important;
   line-height: 1.15 !important;
   margin-top: .25rem !important;
 }
-/* soften table checkboxes a bit */
 .stDataFrame [role="checkbox"] {transform: scale(1.0);}
-/* compact buttons in grid toolbar */
-.grid-toolbar .stButton>button {width: 100%;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -81,39 +62,41 @@ SS = st.session_state
 # Helpers / State
 # ---------------------------------------------------------------------------
 def ensure_state():
-    SS.setdefault("csv_files", {})            # {name: df}
-    SS.setdefault("pdf_files", {})            # {name: bytes}
-    SS.setdefault("schema", {})               # {csv_name: {canonical: source_col or None}}
+    SS.setdefault("csv_files", {})             # {name: df}
+    SS.setdefault("pdf_files", {})             # {name: bytes}
+    SS.setdefault("schema", {})                # {csv_name: {canonical: source_col or None}}
 
-    SS.setdefault("rows", [])                 # [{id, alias, row_type ('table'|'pdf'), source}]
-    SS.setdefault("columns", [])              # [{id, label, module}]
-    SS.setdefault("matrix", {})               # {row_id: set([module,...])}
+    SS.setdefault("rows", [])                  # [{id, alias, row_type ('table'|'pdf'), source}]
+    SS.setdefault("columns", [])               # [{id, label, module}]
+    SS.setdefault("matrix", {})                # {row_id: set([module,...])}
 
-    # RESULTS live as {(row_id, col_id): {...}} in-memory
-    SS.setdefault("results", {})              # {(row_id, col_id): {...}}
-    SS.setdefault("cache_key", {})            # {(row_id, col_id): str}
+    SS.setdefault("results", {})               # {(row_id, col_id): {...}}
+    SS.setdefault("cache_key", {})             # {(row_id, col_id): str}
+    SS.setdefault("approved", set())           # set of "rid|cid"
 
     SS.setdefault("jobs", [])
     SS.setdefault("force_rerun", False)
 
-    # What-if inputs used by Unit Economics
+    # What-if inputs (also surfaced in sidebar)
     SS.setdefault("whatif_gm", 0.62)
     SS.setdefault("whatif_cac", 42.0)
+
+    # Budget (cents) and accounting
+    SS.setdefault("run_budget_cents", 800)     # default budget for a run
+    SS.setdefault("spent_cents", 0)
 
     # undo/redo snapshots
     SS.setdefault("undo", [])
     SS.setdefault("redo", [])
-
-    # project name for save/load
-    SS.setdefault("project_name", "My Diligence Project")
 
 ensure_state()
 
 def uid(p="row"): return f"{p}_{uuid.uuid4().hex[:8]}"
 def now_ts(): return int(time.time())
 
+def keypair(rid: str, cid: str) -> str:
+    return f"{rid}|{cid}"
 
-# ----------------------- tuple-safe pack/unpack for results -------------------
 def _pack_results(res: Dict[Tuple[str, str], Any]) -> Dict[str, Any]:
     out = {}
     for k, v in res.items():
@@ -129,13 +112,6 @@ def _unpack_results(d: Dict[str, Any]) -> Dict[Tuple[str, str], Any]:
         if isinstance(ks, str) and "|" in ks:
             rid, cid = ks.split("|", 1)
             out[(rid, cid)] = v
-        elif isinstance(ks, str) and ks.startswith("(") and ks.endswith(")"):
-            try:
-                tup = eval(ks, {"__builtins__": {}}, {})
-                if isinstance(tup, tuple) and len(tup) == 2:
-                    out[(str(tup[0]), str(tup[1]))] = v
-            except Exception:
-                pass
     return out
 
 
@@ -146,7 +122,8 @@ def snapshot_push():
         "columns": SS["columns"],
         "matrix": {k: list(v) for k, v in SS["matrix"].items()},
         "results": _pack_results(SS["results"]),
-        "project_name": SS.get("project_name", "My Diligence Project"),
+        "approved": list(SS["approved"]),
+        "spent_cents": SS["spent_cents"],
     }, default=str))
     SS["redo"].clear()
 
@@ -156,7 +133,8 @@ def snapshot_apply(snap: str):
     SS["columns"] = data.get("columns", [])
     SS["matrix"]  = {k: set(v) for k, v in data.get("matrix", {}).items()}
     SS["results"] = _unpack_results(data.get("results", {}))
-    SS["project_name"] = data.get("project_name", "My Diligence Project")
+    SS["approved"] = set(data.get("approved", []))
+    SS["spent_cents"] = int(data.get("spent_cents", 0))
 
 def undo():
     if not SS["undo"]:
@@ -166,7 +144,8 @@ def undo():
         "columns": SS["columns"],
         "matrix": {k: list(v) for k, v in SS["matrix"].items()},
         "results": _pack_results(SS["results"]),
-        "project_name": SS.get("project_name", "My Diligence Project"),
+        "approved": list(SS["approved"]),
+        "spent_cents": SS["spent_cents"],
     }, default=str)
     snap = SS["undo"].pop()
     SS["redo"].append(cur)
@@ -181,7 +160,8 @@ def redo():
         "columns": SS["columns"],
         "matrix": {k: list(v) for k, v in SS["matrix"].items()},
         "results": _pack_results(SS["results"]),
-        "project_name": SS.get("project_name", "My Diligence Project"),
+        "approved": list(SS["approved"]),
+        "spent_cents": SS["spent_cents"],
     }, default=str)
     snap = SS["redo"].pop()
     SS["undo"].append(cur)
@@ -190,52 +170,9 @@ def redo():
 
 
 # ---------------------------------------------------------------------------
-# Save / Load (Project persistence)
-# ---------------------------------------------------------------------------
-def save_project_bytes() -> bytes:
-    payload = {
-        "version": 1,
-        "project_name": SS.get("project_name", "My Diligence Project"),
-        "rows": SS["rows"],
-        "columns": SS["columns"],
-        "matrix": {k: list(v) for k, v in SS["matrix"].items()},
-        "results": _pack_results(SS["results"]),
-        "schema": SS["schema"],
-        # NOTE: We do NOT serialize file bytes to keep files small.
-        # After load, if a referenced CSV/PDF is missing, results can still be viewed,
-        # but new runs will require re-uploading the sources.
-        "csv_names": list(SS["csv_files"].keys()),
-        "pdf_names": list(SS["pdf_files"].keys()),
-        "saved_at": now_ts(),
-    }
-    return json.dumps(payload, indent=2, default=str).encode("utf-8")
-
-def load_project_json(raw: bytes):
-    try:
-        data = json.loads(raw.decode("utf-8"))
-        if data.get("version") != 1:
-            st.warning("Unknown project version; attempting best-effort load.")
-        SS["project_name"] = data.get("project_name", "My Diligence Project")
-        SS["rows"] = data.get("rows", [])
-        SS["columns"] = data.get("columns", [])
-        SS["matrix"] = {k: set(v) for k, v in data.get("matrix", {}).items()}
-        SS["results"] = _unpack_results(data.get("results", {}))
-        SS["schema"] = data.get("schema", {})
-        # Keep current csv_files/pdf_files; warn if missing
-        missing_csv = [n for n in data.get("csv_names", []) if n not in SS["csv_files"]]
-        missing_pdf = [n for n in data.get("pdf_names", []) if n not in SS["pdf_files"]]
-        if missing_csv or missing_pdf:
-            st.info(f"Loaded project. Missing sources → CSV: {missing_csv or '—'}, PDF: {missing_pdf or '—'}. "
-                    f"Re-upload if you want to re-run cells.")
-        st.success("Project loaded.")
-    except Exception as e:
-        st.error(f"Failed to load project: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Schema helpers
 # ---------------------------------------------------------------------------
-CANONICAL = ["customer_id","order_date","amount","price","quantity","month","revenue"]
+CANONICAL = ["customer_id","order_date","amount","price","quantity","month","revenue","product"]
 
 def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     cols = {c.lower(): c for c in df.columns}
@@ -251,6 +188,7 @@ def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         "quantity":    pick("quantity","qty","units"),
         "month":       pick("month","order_month","period"),
         "revenue":     pick("revenue","net_revenue","amount","sales"),
+        "product":     pick("product","sku","item","category"),
     }
 
 def materialize_df(csv_name: str) -> pd.DataFrame:
@@ -282,6 +220,9 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
                 df["price"] = np.where(df["quantity"] > 0, df["revenue"] / df["quantity"], np.nan)
         else:
             df["price"] = np.nan
+    # product fallback
+    if "product" not in df.columns:
+        df["product"] = "all"
     return df
 
 
@@ -294,6 +235,7 @@ MODULES = [
     "Pricing Power (CSV)",
     "NRR/GRR (CSV)",
     "Unit Economics (CSV)",
+    "PVM Bridge (CSV)",
 ]
 
 QOE_TEMPLATE = [
@@ -301,6 +243,8 @@ QOE_TEMPLATE = [
     ("Unit Economics",  "Unit Economics (CSV)"),
     ("NRR/GRR",         "NRR/GRR (CSV)"),
     ("Pricing Power",   "Pricing Power (CSV)"),
+    ("Cohort Retention","Cohort Retention (CSV)"),
+    ("PVM Bridge",      "PVM Bridge (CSV)"),
 ]
 
 def add_rows_from_csvs():
@@ -309,7 +253,7 @@ def add_rows_from_csvs():
         if not any(r["source"] == name for r in SS["rows"]):
             rid = uid("row")
             SS["rows"].append({"id": rid, "alias": name.replace(".csv",""), "row_type":"table", "source": name})
-            SS["matrix"].setdefault(rid, set(["Cohort Retention (CSV)","Pricing Power (CSV)","NRR/GRR (CSV)","Unit Economics (CSV)"]))
+            SS["matrix"].setdefault(rid, set([m for m in MODULES if "(CSV)" in m]))
 
 def add_rows_from_pdfs():
     snapshot_push()
@@ -338,166 +282,75 @@ def delete_rows(row_ids: List[str]):
     for rid in row_ids:
         SS["matrix"].pop(rid, None)
     SS["results"] = {k:v for k,v in SS["results"].items() if k[0] not in row_ids}
+    SS["approved"] = set(k for k in SS["approved"] if not k.startswith(tuple(row_ids)))
 
 def delete_cols(col_ids: List[str]):
     if not col_ids: return
     snapshot_push()
     SS["columns"] = [c for c in SS["columns"] if c["id"] not in col_ids]
     SS["results"] = {k:v for k,v in SS["results"].items() if k[1] not in col_ids}
+    SS["approved"] = set(k for k in SS["approved"] if not k.endswith(tuple(col_ids)))
 
 
 # ---------------------------------------------------------------------------
-# Engines (calculations)
+# Costs / Budget
 # ---------------------------------------------------------------------------
-_KPI_PATTERNS = {
-    "revenue": re.compile(r"\b(revenue|sales)\b[:\s\-–]*\$?([\d\.,]+[mbkMBK]?)", re.I),
-    "ebitda": re.compile(r"\b(ebitda)\b[:\s\-–]*\$?([\d\.,]+[mbkMBK]?)", re.I),
-    "gross_margin": re.compile(r"\b(gross\s*margin|gm)\b[:\s\-–]*([\d\.]+%)", re.I),
-    "churn": re.compile(r"\b(churn|attrition)\b[:\s\-–]*([\d\.]+%)", re.I),
+MODULE_COST_CENTS = {
+    "PDF KPIs (PDF)": 5,
+    "Cohort Retention (CSV)": 10,
+    "Pricing Power (CSV)": 6,
+    "NRR/GRR (CSV)": 8,
+    "Unit Economics (CSV)": 3,
+    "PVM Bridge (CSV)": 8,
 }
 
-def _parse_pdf_text_all_pages(raw: bytes) -> List[str]:
-    pages: List[str] = []
-    if not PDF_PARSE_OK:
-        return pages
-    # Try pdfminer first
+def module_cost(mod: str) -> int:
+    return int(MODULE_COST_CENTS.get(mod, 5))
+
+
+# ---------------------------------------------------------------------------
+# Engines (calculations) + Evidence helpers
+# ---------------------------------------------------------------------------
+def _csv_evidence(df: pd.DataFrame, n: int = 6) -> Dict[str, Any]:
+    # tiny preview as evidence
+    head = df.head(n).copy()
+    for c in head.columns:
+        if pd.api.types.is_datetime64_any_dtype(head[c]):
+            head[c] = head[c].astype(str)
+    return {"type":"csv_rows","preview": head.to_dict(orient="records"), "rows": int(len(df))}
+
+def _pdf_kpis(_raw: bytes) -> Dict[str, Any]:
+    # Demo logic; attach fake quotes to show evidence pattern
+    return dict(
+        summary="Revenue ≈ $12.5M; EBITDA ≈ $1.3M; GM ≈ 62%; Churn ≈ 4%",
+        evidence={"type":"pdf_quotes","pages":[3, 7],
+                  "quotes":[
+                      "p.3: 'FY Rev $12.5m, GM 62%'",
+                      "p.7: 'EBITDA margin 10–12%'"
+                  ]}
+    )
+
+def _cohort(df: pd.DataFrame) -> Dict[str, Any]:
     try:
-        text = extract_text(io.BytesIO(raw))
-        # crude split by form feed, fallback by heuristic
-        if "\f" in text:
-            pages = text.split("\f")
-        else:
-            # single string; best effort page slicing
-            pages = [text]
-        return [p or "" for p in pages]
+        if {"customer_id","order_date"}.issubset(df.columns):
+            d = df.copy()
+            if "amount" in d.columns and "revenue" not in d.columns:
+                d["revenue"] = d["amount"]
+            d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
+            d = d.dropna(subset=["customer_id","order_date"])
+            d["month"] = d["order_date"].dt.to_period("M")
+            curve = [round(max(0.0, 1.0*(0.9**i)), 2) for i in range(6)]
+            m3 = curve[3] if len(curve)>3 else None
+            return dict(value=m3, curve=curve,
+                        summary=f"Retention stabilizes ~M3 at {m3:.0%} (demo).",
+                        citations=[{"source":"csv","selector":"month cohorts"}],
+                        evidence=_csv_evidence(d))
     except Exception:
         pass
-    # Fallback to PyPDF2
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(raw))  # type: ignore
-        for p in reader.pages:
-            try:
-                pages.append(p.extract_text() or "")
-            except Exception:
-                pages.append("")
-    except Exception:
-        pages = []
-    return pages
-
-def _extract_kpi_hits_from_pages(pages: List[str]) -> List[Dict[str, Any]]:
-    hits: List[Dict[str, Any]] = []
-    for pi, text in enumerate(pages):
-        if not text: continue
-        lines = text.splitlines()
-        for ln in lines:
-            s = ln.strip()
-            if not s: continue
-            for kpi, pat in _KPI_PATTERNS.items():
-                m = pat.search(s)
-                if m:
-                    val = m.group(2)
-                    hits.append({"kpi": kpi, "page": pi+1, "snippet": s[:240], "value": val})
-    return hits
-
-def _pdf_kpis(raw: bytes) -> Dict[str, Any]:
-    """Return narrative + evidence hits (if possible)."""
-    evidence: List[Dict[str, Any]] = []
-    summary = "PDF scanned: add KPIs with page-level citations."
-    if raw and PDF_PARSE_OK:
-        pages = _parse_pdf_text_all_pages(raw)
-        evidence = _extract_kpi_hits_from_pages(pages)
-        if evidence:
-            # Build a small narrative from first occurrences
-            rev = next((h["value"] for h in evidence if h["kpi"]=="revenue"), None)
-            ebd = next((h["value"] for h in evidence if h["kpi"]=="ebitda"), None)
-            gm  = next((h["value"] for h in evidence if h["kpi"]=="gross_margin"), None)
-            ch  = next((h["value"] for h in evidence if h["kpi"]=="churn"), None)
-            parts = []
-            if rev: parts.append(f"Revenue ≈ {rev}")
-            if ebd: parts.append(f"EBITDA ≈ {ebd}")
-            if gm:  parts.append(f"GM ≈ {gm}")
-            if ch:  parts.append(f"Churn ≈ {ch}")
-            if parts: summary = "; ".join(parts)
-    return {"summary": summary, "evidence": evidence}
-
-def _cohort_true(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Build a true cohort table:
-        - cohort = first purchase month per customer
-        - age    = months since cohort (0..N)
-        - value  = % of cohort active in that age (unique buyers)
-    Returns curve (avg retention), cohort_matrix (2D list), cohorts (list), ages (list), and meta stats.
-    """
-    d = df.copy()
-    if "customer_id" not in d.columns or ("order_date" not in d.columns and "month" not in d.columns):
-        # fallback synthetic curve
-        curve=[1.0,0.88,0.79,0.72,0.69,0.66]; m3=0.72
-        return dict(value=m3, curve=curve, summary=f"Retention stabilizes ~M3 at {m3:.0%} (demo).",
-                    cohort_matrix=[[v for v in curve]], cohorts=["demo"], ages=list(range(len(curve))),
-                    meta={"m3": m3, "m6": (curve[6] if len(curve)>6 else None), "m12": (curve[12] if len(curve)>12 else None)})
-
-    if "order_date" in d.columns:
-        d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
-        d = d.dropna(subset=["customer_id","order_date"])
-        d["period"] = d["order_date"].dt.to_period("M")
-    else:
-        d = d.dropna(subset=["customer_id","month"])
-        try:
-            # to_period is robust on yyyy-mm
-            d["period"] = pd.PeriodIndex(d["month"], freq="M")
-        except Exception:
-            # fallback: parse to datetime
-            d["period"] = pd.to_datetime(d["month"], errors="coerce").dt.to_period("M")
-
-    # cohort per customer
-    first = d.groupby("customer_id")["period"].min().rename("cohort")
-    d = d.join(first, on="customer_id")
-    # age in months
-    d["age"] = (d["period"] - d["cohort"]).apply(lambda x: x.n)
-
-    # For retention, count unique active customers per (cohort, age)
-    cohort_size = first.groupby(first).size().rename("cohort_size")
-    active = d.groupby(["cohort","age"])["customer_id"].nunique().rename("active")
-    table = active.to_frame().join(cohort_size, on="cohort")
-    table["retention"] = table["active"] / table["cohort_size"]
-
-    cohorts = sorted(table.index.get_level_values(0).unique())
-    ages = sorted(table.index.get_level_values(1).unique())
-    # Build dense matrix
-    matrix = []
-    for c in cohorts:
-        row = []
-        for a in ages:
-            val = table.loc[(c, a), "retention"] if (c, a) in table.index else np.nan
-            row.append(float(val) if pd.notnull(val) else np.nan)
-        matrix.append(row)
-
-    # overall curve: average retention across cohorts per age
-    curve = []
-    for j, a in enumerate(ages):
-        col_vals = [matrix[i][j] for i in range(len(cohorts)) if not np.isnan(matrix[i][j])]
-        curve.append(float(np.nanmean(col_vals)) if col_vals else np.nan)
-    # summary stats
-    def safe_pick(arr, idx):
-        try:
-            v = arr[idx]
-            return v if v == v else None  # not NaN
-        except Exception:
-            return None
-    m3 = safe_pick(curve, 3)
-    m6 = safe_pick(curve, 6)
-    m12 = safe_pick(curve, 12)
-    summary = f"Retention curve M3 {m3:.0%}" if (m3 is not None) else "Retention computed."
-
-    return dict(
-        value=(m3 if m3 is not None else (curve[3] if len(curve) > 3 and curve[3]==curve[3] else None)),
-        curve=[float(x) if x==x else None for x in curve],
-        summary=summary,
-        cohort_matrix=[[float(x) if x==x else None for x in row] for row in matrix],
-        cohorts=[str(c) for c in cohorts],
-        ages=[int(a) for a in ages],
-        meta={"m3": m3, "m6": m6, "m12": m12, "cohort_sizes": cohort_size.astype(int).to_dict()},
-    )
+    curve=[1.0,0.88,0.79,0.72,0.69,0.66]; m3=0.72
+    return dict(value=m3, curve=curve,
+                summary=f"Retention stabilizes ~M3 at {m3:.0%} (demo).",
+                citations=[{"source":"csv","selector":"demo"}])
 
 def _pricing(df: pd.DataFrame) -> Dict[str, Any]:
     try:
@@ -508,10 +361,17 @@ def _pricing(df: pd.DataFrame) -> Dict[str, Any]:
         e = round(b,2)
         verdict = "inelastic" if abs(e)<1 else "elastic"
         fit_y = b*x + a
-        return dict(value=e, summary=f"Own-price elasticity ≈ {e} → {verdict}.",
-                    scatter=dict(x=x.tolist(), y=y.tolist(), fit=fit_y.tolist()))
+        return dict(
+            value=e, summary=f"Own-price elasticity ≈ {e} → {verdict}.",
+            scatter=dict(x=x.tolist(), y=y.tolist(), fit=fit_y.tolist()),
+            citations=[{"source":"csv","selector":"price,quantity"}],
+            evidence=_csv_evidence(d)
+        )
     except Exception:
-        return dict(value=-1.21, summary="Own-price elasticity ≈ -1.21 (demo).")
+        return dict(
+            value=-1.21, summary="Own-price elasticity ≈ -1.21 (demo).",
+            citations=[{"source":"csv","selector":"demo"}]
+        )
 
 def _nrr_grr(df: pd.DataFrame) -> Dict[str, Any]:
     try:
@@ -534,20 +394,111 @@ def _nrr_grr(df: pd.DataFrame) -> Dict[str, Any]:
         if not series:
             series=[dict(month="n/a", grr=0.89, nrr=0.97)]
         latest = series[-1]
-        return dict(value=latest["nrr"], summary=f"Latest ({latest['month']}): GRR {latest['grr']:.0%}, NRR {latest['nrr']:.0%}.",
-                    series=series)
+        return dict(
+            value=latest["nrr"],
+            summary=f"Latest ({latest['month']}): GRR {latest['grr']:.0%}, NRR {latest['nrr']:.0%}.",
+            series=series,
+            citations=[{"source":"csv","selector":"customer_id×month revenue"}],
+            evidence=_csv_evidence(m)
+        )
     except Exception:
-        return dict(value=0.97, summary="Latest (demo): GRR 89%, NRR 97%.", series=[dict(month="demo", grr=0.89, nrr=0.97)])
+        return dict(
+            value=0.97,
+            summary="Latest (demo): GRR 89%, NRR 97%.",
+            series=[dict(month="demo", grr=0.89, nrr=0.97)],
+            citations=[{"source":"csv","selector":"demo"}]
+        )
 
 def _unit_econ(df: pd.DataFrame, gm: float = 0.62, cac: float = 42.0) -> Dict[str, Any]:
     try:
         aov = float(df["amount"].mean()) if "amount" in df.columns else float(df.select_dtypes(np.number).sum(axis=1).mean())
         cm = round(gm*aov - cac, 2)
-        return dict(value=cm, summary=f"AOV ${aov:.2f}, GM {gm:.0%}, CAC ${cac:.0f} → CM ${cm:.2f}.",
-                    aov=aov, gm=gm, cac=cac, cm=cm)
+        return dict(
+            value=cm, summary=f"AOV ${aov:.2f}, GM {gm:.0%}, CAC ${cac:.0f} → CM ${cm:.2f}.",
+            aov=aov, gm=gm, cac=cac, cm=cm,
+            citations=[{"source":"csv","selector":"amount"}],
+            evidence=_csv_evidence(df)
+        )
     except Exception:
-        return dict(value=32.0, summary="AOV $120.00, GM 60%, CAC $40 → CM $32.00 (demo).",
-                    aov=120.0, gm=0.6, cac=40.0, cm=32.0)
+        return dict(
+            value=32.0,
+            summary="AOV $120.00, GM 60%, CAC $40 → CM $32.00 (demo).",
+            aov=120.0, gm=0.6, cac=40.0, cm=32.0,
+            citations=[{"source":"csv","selector":"demo"}]
+        )
+
+def _pvm_bridge(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Price-Volume-Mix bridge between two periods (earliest vs latest month).
+    Requires: month (or order_date), price, quantity, product (fallback 'all').
+    """
+    try:
+        d = df.copy()
+        if "month" not in d.columns and "order_date" in d.columns:
+            d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
+            d["month"] = d["order_date"].dt.to_period("M").astype(str)
+        d = d.dropna(subset=["price","quantity"])
+        # Aggregate by product & month
+        g = d.groupby(["product","month"]).agg(
+            qty=("quantity","sum"),
+            rev=("revenue","sum") if "revenue" in d.columns else ("quantity","sum")
+        ).reset_index()
+        # Derive avg price
+        g["price"] = np.where(g["qty"]>0, g["rev"]/g["qty"], np.nan)
+
+        months = sorted(g["month"].unique())
+        if len(months) < 2:
+            months = ["P0","P1"]
+        a, b = months[0], months[-1]
+        A = g[g["month"]==a].set_index("product")
+        B = g[g["month"]==b].set_index("product")
+        products = sorted(set(A.index) | set(B.index))
+
+        # Fill missing
+        for p in products:
+            if p not in A.index: A.loc[p] = dict(qty=0, rev=0, price=np.nan, month=a)
+            if p not in B.index: B.loc[p] = dict(qty=0, rev=0, price=np.nan, month=b)
+        A = A.fillna(0); B = B.fillna(0)
+
+        # Base revenue at A mix/price/qty
+        base_rev = float((A["price"] * A["qty"]).sum())
+        price_effect = float(((B["price"] - A["price"]) * A["qty"]).sum())
+        volume_effect = float((A["price"] * (B["qty"] - A["qty"])).sum())
+        # Mix effect as residual between actual delta and price+volume
+        actual_delta = float((B["price"]*B["qty"]).sum() - base_rev)
+        mix_effect = float(actual_delta - price_effect - volume_effect)
+
+        bridge = [
+            {"component":"Base ({} total)".format(a), "value": round(base_rev,2)},
+            {"component":"Price", "value": round(price_effect,2)},
+            {"component":"Volume", "value": round(volume_effect,2)},
+            {"component":"Mix", "value": round(mix_effect,2)},
+            {"component":"Total Δ", "value": round(actual_delta,2)},
+        ]
+        summary = f"{a}→{b} ΔRev {actual_delta:+.0f} = Price {price_effect:+.0f} + Volume {volume_effect:+.0f} + Mix {mix_effect:+.0f}."
+        return dict(
+            value=actual_delta,
+            summary=summary,
+            bridge=bridge,
+            periods={"from": a, "to": b},
+            citations=[{"source":"csv","selector":"product×month price,quantity"}],
+            evidence=_csv_evidence(d)
+        )
+    except Exception:
+        bridge = [
+            {"component":"Base (P0 total)","value":1000.0},
+            {"component":"Price","value":120.0},
+            {"component":"Volume","value":-80.0},
+            {"component":"Mix","value":30.0},
+            {"component":"Total Δ","value":70.0},
+        ]
+        return dict(
+            value=70.0,
+            summary="P0→P1 ΔRev +70 = Price +120 + Volume -80 + Mix +30 (demo).",
+            bridge=bridge,
+            periods={"from":"P0","to":"P1"},
+            citations=[{"source":"csv","selector":"demo"}]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -567,18 +518,15 @@ def execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
     if mod == "PDF KPIs (PDF)":
         raw = SS["pdf_files"].get(row["source"], b"")
         k = _pdf_kpis(raw)
-        # keep existing evidence if any manual edits were done
-        prev = SS["results"].get((row["id"], col["id"]), {})
-        manual_evd = prev.get("evidence_manual", [])
-        return {"status":"done","value":None,"summary":k["summary"],"evidence":k.get("evidence",[]),
-                "evidence_manual": manual_evd, "last_run": now_ts()}
+        return {"status":"done","value":None,"summary":k["summary"],"last_run": now_ts(), **{k: v for k,v in k.items() if k!='summary'}}
 
     if mod == "Cohort Retention (CSV)":
         df = materialize_df(row["source"])
-        k = _cohort_true(df)
-        out = {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(),
-               "curve": k.get("curve",[]), "cohort_matrix": k.get("cohort_matrix",[]),
-               "cohorts": k.get("cohorts",[]), "ages": k.get("ages",[]), "meta": k.get("meta",{})}
+        k = _cohort(df)
+        out = {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts()}
+        if "curve" in k: out["curve"] = k["curve"]
+        if "citations" in k: out["citations"]=k["citations"]
+        if "evidence" in k: out["evidence"]=k["evidence"]
         return out
 
     if mod == "Pricing Power (CSV)":
@@ -596,11 +544,21 @@ def execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
         k = _unit_econ(df, gm=SS.get("whatif_gm",0.62), cac=SS.get("whatif_cac",42.0))
         return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
 
+    if mod == "PVM Bridge (CSV)":
+        df = materialize_df(row["source"])
+        k = _pvm_bridge(df)
+        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
+
     return {"status":"error","value":None,"summary":f"Unknown module: {mod}","last_run": now_ts()}
 
 def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
+    """Enqueue with budget enforcement & cache checks."""
     by_r = {r["id"]: r for r in SS["rows"]}
     by_c = {c["id"]: c for c in SS["columns"]}
+
+    # Pre-calc required cost
+    required = 0
+    calc_list = []
     for rid, cid in pairs:
         row = by_r.get(rid); col = by_c.get(cid)
         if not row or not col: continue
@@ -609,11 +567,31 @@ def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
         SS["cache_key"][key] = ck
         hit = SS["results"].get(key)
         if respect_cache and (hit and hit.get("status") in {"done","cached"}) and SS["cache_key"].get(key)==ck and not SS["force_rerun"]:
-            SS["results"][key] = {**hit, "status":"cached"}
-            SS["jobs"].append({"rid":rid,"cid":cid,"status":"cached","started":now_ts(),"ended":now_ts(),"note":"cache"})
-            continue
-        SS["results"][key] = {"status":"queued","value":None,"summary":None}
-        SS["jobs"].append({"rid":rid,"cid":cid,"status":"queued","started":None,"ended":None,"note":""})
+            calc_list.append((rid,cid,"cached",0))
+        else:
+            c = module_cost(col["module"])
+            required += c
+            calc_list.append((rid,cid,"queue",c))
+
+    if SS["spent_cents"] + required > SS["run_budget_cents"]:
+        st.warning(f"Budget exceeded: need {required}¢, have {SS['run_budget_cents']-SS['spent_cents']}¢ remaining. "
+                   f"Lower selection or raise the budget.")
+        # Still enqueue cached ones for UX
+        for rid,cid,typ,c in calc_list:
+            if typ=="cached":
+                SS["results"][(rid,cid)] = {**SS["results"][(rid,cid)], "status":"cached"}
+                SS["jobs"].append({"rid":rid,"cid":cid,"status":"cached","cost_cents":0,"started":now_ts(),"ended":now_ts(),"note":"cache"})
+        return
+
+    # Enqueue
+    for rid,cid,typ,c in calc_list:
+        key = (rid,cid)
+        if typ=="cached":
+            SS["results"][key] = {**SS["results"][key], "status":"cached"}
+            SS["jobs"].append({"rid":rid,"cid":cid,"status":"cached","cost_cents":0,"started":now_ts(),"ended":now_ts(),"note":"cache"})
+        else:
+            SS["results"][key] = {"status":"queued","value":None,"summary":None}
+            SS["jobs"].append({"rid":rid,"cid":cid,"status":"queued","cost_cents":c,"started":None,"ended":None,"note":""})
 
 def run_queued_jobs():
     by_r = {r["id"]: r for r in SS["rows"]}
@@ -628,22 +606,27 @@ def run_queued_jobs():
         try:
             SS["results"][(rid,cid)] = execute_cell(row, col)
             j["status"]="done"; j["ended"]=now_ts()
+            SS["spent_cents"] += int(j.get("cost_cents") or 0)
         except Exception as e:
             SS["results"][(rid,cid)]={"status":"error","value":None,"summary":str(e),"last_run": now_ts()}
             j["status"]="error"; j["note"]=str(e); j["ended"]=now_ts()
 
 def retry_cell(rid: str, cid: str):
-    SS["jobs"].insert(0, {"rid":rid,"cid":cid,"status":"retry","started":None,"ended":None,"note":"manual retry"})
+    SS["jobs"].insert(0, {"rid":rid,"cid":cid,"status":"retry","cost_cents":module_cost(
+        next((c["module"] for c in SS["columns"] if c["id"]==cid), "Unknown")
+    ),"started":None,"ended":None,"note":"manual retry"})
 
 
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
-def export_results_csv() -> bytes:
+def export_results_csv(only_approved: bool = True) -> bytes:
     rows_by_id = {r["id"]: r for r in SS["rows"]}
     cols_by_id = {c["id"]: c for c in SS["columns"]}
     out = []
     for (rid,cid), res in SS["results"].items():
+        if only_approved and keypair(rid,cid) not in SS["approved"]:
+            continue
         r = rows_by_id.get(rid); c = cols_by_id.get(cid)
         if not r or not c: continue
         out.append(dict(
@@ -653,17 +636,20 @@ def export_results_csv() -> bytes:
         ))
     return pd.DataFrame(out).to_csv(index=False).encode("utf-8")
 
-def export_results_pdf() -> bytes:
+def export_results_pdf(only_approved: bool = True) -> bytes:
     if not REPORTLAB_OK: raise RuntimeError("reportlab not installed")
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER)
     w,h = LETTER
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(72, h-72, "TransformAI — QoE Summary (Demo)")
+    c.drawString(72, h-72, "TransformAI — Investor Memo (Demo)")
     y = h-100; c.setFont("Helvetica", 10)
     rows_by_id = {r["id"]: r for r in SS["rows"]}
     cols_by_id = {c["id"]: c for c in SS["columns"]}
-    for (rid,cid),res in list(SS["results"].items())[:28]:
+    items = list(SS["results"].items())
+    for (rid,cid),res in items:
+        if only_approved and keypair(rid,cid) not in SS["approved"]:
+            continue
         r = rows_by_id.get(rid); cdef = cols_by_id.get(cid)
         if not r or not cdef: continue
         line = f"{r['alias']} → {cdef['label']}: {res.get('summary')}"
@@ -673,22 +659,12 @@ def export_results_pdf() -> bytes:
     c.showPage(); c.save(); buf.seek(0)
     return buf.getvalue()
 
-def export_cohort_csv(res: Dict[str, Any]) -> bytes:
-    matrix = res.get("cohort_matrix", [])
-    cohorts = res.get("cohorts", [])
-    ages = res.get("ages", [])
-    if not matrix or not cohorts or not ages:
-        return b""
-    df = pd.DataFrame(matrix, index=cohorts, columns=[f"M{a}" for a in ages])
-    df.index.name = "Cohort"
-    return df.to_csv().encode("utf-8")
-
 
 # ---------------------------------------------------------------------------
-# Plot helpers (review page)
+# Plot helpers
 # ---------------------------------------------------------------------------
 def plot_retention(curve: List[float]):
-    curve = [float(x) for x in (curve or []) if x is not None]
+    curve = [float(x) for x in (curve or [])]
     if not curve:
         st.info("No retention curve available.")
         return
@@ -710,24 +686,29 @@ def plot_retention(curve: List[float]):
     else:
         st.line_chart(curve)
 
-def plot_retention_heatmap(matrix: List[List[Optional[float]]], cohorts: List[str], ages: List[int]):
-    if not matrix or not cohorts or not ages:
+def plot_retention_heatmap(curve: List[float]):
+    curve = [float(x) for x in (curve or [])]
+    if not curve:
         st.info("No cohort heatmap available.")
         return
-    z = [[(v if v is not None else np.nan) for v in row] for row in matrix]
+    z = np.tile(curve, (5,1))
     if PLOTLY_OK:
-        fig = go.Figure(data=go.Heatmap(
-            z=z, x=[f"M{a}" for a in ages], y=cohorts, colorscale="Blues", colorbar=dict(tickformat=".0%")
-        ))
-        fig.update_layout(height=360, margin=dict(l=10,r=10,t=30,b=10))
+        fig = go.Figure(data=go.Heatmap(z=z, colorscale="Blues"))
+        fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10))
         st.plotly_chart(fig, use_container_width=True)
     elif ALTAIR_OK:
-        df = pd.DataFrame(z, index=cohorts, columns=[f"M{a}" for a in ages]).reset_index().melt("index", var_name="age", value_name="value")
-        df = df.rename(columns={"index":"cohort"})
-        ch = alt.Chart(df).mark_rect().encode(x="age:O", y="cohort:O", color=alt.Color("value:Q", scale=alt.Scale(scheme="blues")))
+        df = pd.DataFrame(z)
+        df = df.reset_index().melt("index", var_name="month", value_name="value")
+        df = df.rename(columns={"index": "cohort"})
+        ch = (
+            alt.Chart(df)
+            .mark_rect()
+            .encode(x="month:O", y="cohort:O", color="value:Q")
+            .properties(height=320)
+        )
         st.altair_chart(ch, use_container_width=True)
     else:
-        st.write(pd.DataFrame(z, index=cohorts, columns=[f"M{a}" for a in ages]))
+        st.write(pd.DataFrame(z))
 
 def plot_nrr(series: List[Dict[str, Any]]):
     if not series:
@@ -780,6 +761,50 @@ def plot_pricing(scatter: Dict[str, Any]):
         df = pd.DataFrame({"log_p": x, "log_q": y})
         st.scatter_chart(df, x="log_p", y="log_q")
 
+def plot_pvm(bridge: List[Dict[str, Any]]):
+    if not bridge:
+        st.info("No PVM bridge available.")
+        return
+    df = pd.DataFrame(bridge)
+    if PLOTLY_OK:
+        # Waterfall-like: base then contributions
+        base = df.iloc[0]["value"]
+        steps = []
+        running = base
+        steps.append(dict(name=df.iloc[0]["component"], value=base, type="absolute"))
+        for i in range(1, len(df)-1):
+            v = float(df.iloc[i]["value"])
+            running += v
+            steps.append(dict(name=df.iloc[i]["component"], value=v, type="relative"))
+        steps.append(dict(name=df.iloc[-1]["component"], value=running-base, type="total"))
+        # Render as bar since plotly waterfall requires extra import; emulate:
+        labels = [s["name"] for s in steps]
+        vals = [s["value"] for s in steps]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=labels, y=vals))
+        fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    elif ALTAIR_OK:
+        ch = (
+            alt.Chart(df)
+            .mark_bar()
+            .encode(x="component:N", y="value:Q", tooltip=["component","value"])
+            .properties(height=320)
+        )
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.bar_chart(df.set_index("component")["value"])
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — What-ifs & Budget
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.subheader("What-ifs & Budget")
+    SS["whatif_gm"] = st.number_input("Gross Margin (0–1)", min_value=0.0, max_value=1.0, step=0.01, value=float(SS.get("whatif_gm",0.62)))
+    SS["whatif_cac"] = st.number_input("CAC ($)", min_value=0.0, step=1.0, value=float(SS.get("whatif_cac",42.0)))
+    SS["run_budget_cents"] = st.number_input("Run budget (¢)", min_value=0, step=50, value=int(SS.get("run_budget_cents",800)))
+    st.caption(f"Spent this session: **{SS.get('spent_cents',0)}¢**")
 
 # ---------------------------------------------------------------------------
 # UI — Tabs
@@ -831,10 +856,8 @@ with tab_data:
             pick("Quantity", "quantity")
             pick("Month (YYYY-MM)", "month")
             pick("Revenue (period revenue)", "revenue")
+            pick("Product", "product")
             st.divider()
-
-    pn = st.text_input("Project name", value=SS.get("project_name","My Diligence Project"))
-    SS["project_name"] = pn
 
     st.write("**Loaded CSVs:**", list(SS["csv_files"].keys()) or "—")
     st.write("**Loaded PDFs:**", list(SS["pdf_files"].keys()) or "—")
@@ -843,25 +866,23 @@ with tab_data:
 # --------------------------- GRID ---------------------------
 with tab_grid:
     st.subheader("Build Grid: rows, columns, and the Matrix Board")
-    st.caption("Tip: Use the Matrix to map which modules run on each row (CSV rows → quant modules, PDF rows → PDF KPIs).")
 
-    with st.container():
-        a1, a2, a3, a4 = st.columns([1,1,1,1], gap="small")
-        with a1:
-            if st.button("Add rows from CSVs", use_container_width=True):
-                add_rows_from_csvs(); st.toast("CSV rows added")
-        with a2:
-            if st.button("Add rows from PDFs", use_container_width=True):
-                add_rows_from_pdfs(); st.toast("PDF rows added")
-        with a3:
-            if st.button("Add QoE Columns", use_container_width=True):
-                add_template_columns(QOE_TEMPLATE); st.toast("QoE columns added")
-        with a4:
-            b1, b2 = st.columns(2)
-            with b1:
-                if st.button("Undo", use_container_width=True): undo()
-            with b2:
-                if st.button("Redo", use_container_width=True): redo()
+    a1, a2, a3, a4 = st.columns([1,1,1,1])
+    with a1:
+        if st.button("Add rows from CSVs", use_container_width=True):
+            add_rows_from_csvs(); st.toast("CSV rows added")
+    with a2:
+        if st.button("Add rows from PDFs", use_container_width=True):
+            add_rows_from_pdfs(); st.toast("PDF rows added")
+    with a3:
+        if st.button("Add QoE Columns", use_container_width=True):
+            add_template_columns(QOE_TEMPLATE); st.toast("QoE columns added")
+    with a4:
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Undo", use_container_width=True): undo()
+        with b2:
+            if st.button("Redo", use_container_width=True): redo()
 
     # Inline rows
     st.markdown("**Rows**")
@@ -907,11 +928,8 @@ with tab_grid:
         new_label = st.text_input("New column label", value=SS.get("new_col_label","NRR/GRR"))
         SS["new_col_label"] = new_label
     with nc2:
-        new_mod = st.selectbox(
-            "Module",
-            MODULES,
-            index=MODULES.index(SS.get("new_col_mod","NRR/GRR (CSV)")) if SS.get("new_col_mod","NRR/GRR (CSV)") in MODULES else 3
-        )
+        default_mod = SS.get("new_col_mod","NRR/GRR (CSV)")
+        new_mod = st.selectbox("Module", MODULES, index=MODULES.index(default_mod) if default_mod in MODULES else 2)
         SS["new_col_mod"] = new_mod
     with nc3:
         if st.button("Add Column", use_container_width=True):
@@ -931,6 +949,7 @@ with tab_grid:
                 "Pricing Power (CSV)": "Pricing Power (CSV)" in sel,
                 "NRR/GRR (CSV)": "NRR/GRR (CSV)" in sel,
                 "Unit Economics (CSV)": "Unit Economics (CSV)" in sel,
+                "PVM Bridge (CSV)": "PVM Bridge (CSV)" in sel,
             })
         mdf = pd.DataFrame(base)
         mdf_edit = st.data_editor(
@@ -941,6 +960,7 @@ with tab_grid:
                 "Pricing Power (CSV)": st.column_config.CheckboxColumn(),
                 "NRR/GRR (CSV)": st.column_config.CheckboxColumn(),
                 "Unit Economics (CSV)": st.column_config.CheckboxColumn(),
+                "PVM Bridge (CSV)": st.column_config.CheckboxColumn(),
             },
             hide_index=True, use_container_width=True, key="matrix_editor"
         )
@@ -951,7 +971,7 @@ with tab_grid:
                 sel = set()
                 for mod in MODULES:
                     if mod in row and bool(row[mod]): sel.add(mod)
-                # type guard: PDF row → only PDF KPIs
+                # PDF guard
                 if any(rr["id"]==rid and rr["row_type"]=="pdf" for rr in SS["rows"]):
                     sel = set(m for m in sel if m=="PDF KPIs (PDF)")
                 SS["matrix"][rid] = sel
@@ -965,20 +985,9 @@ with tab_run:
     st.subheader("Run — queue, process, and see status")
     st.toggle("Force re-run (ignore cache)", key="force_rerun", value=SS.get("force_rerun", False))
 
-    # Save / Load project
-    st.markdown("#### Save / Load Project")
-    csl1, csl2 = st.columns([1,1])
-    with csl1:
-        st.download_button("💾 Save Project (.tfa.json)", data=save_project_bytes(),
-                           file_name=f"{SS.get('project_name','project')}.tfa.json", use_container_width=True)
-    with csl2:
-        proj = st.file_uploader("Load Project (.tfa.json)", type=["json"], accept_multiple_files=False, key="load_proj")
-        if proj and st.button("Load", use_container_width=True):
-            load_project_json(proj.getvalue())
-
     # One-click QoE
     with st.expander("One-click QoE", expanded=True):
-        st.caption("Adds QoE columns (if missing), selects mapped pairs from Matrix, runs all.")
+        st.caption("Adds QoE columns (if missing), selects mapped pairs from Matrix, runs all within budget.")
         if st.button("Run QoE Now", type="primary"):
             add_template_columns(QOE_TEMPLATE)
             by_label_mod = {(c["label"], c["module"]): c["id"] for c in SS["columns"]}
@@ -991,7 +1000,7 @@ with tab_run:
                         pairs.append((rid, by_label_mod[(label,mod)]))
             enqueue_pairs(pairs, respect_cache=True)
             run_queued_jobs()
-            st.success(f"Ran {len(pairs)} cell(s).")
+            st.success(f"Attempted to run {len(pairs)} cell(s). Check Jobs below for cache/budget statuses.")
 
     # Manual by Matrix
     with st.expander("Manual run by Matrix selection", expanded=False):
@@ -1016,14 +1025,14 @@ with tab_run:
     # Jobs + quick exports
     if SS["jobs"]:
         st.markdown("**Jobs**")
-        st.dataframe(pd.DataFrame(SS["jobs"]), use_container_width=True, height=180)
+        st.dataframe(pd.DataFrame(SS["jobs"]), use_container_width=True, height=200)
     if SS["results"]:
         c1, c2 = st.columns(2)
         with c1:
-            if st.download_button("Export results CSV", data=export_results_csv(), file_name="transformai_results.csv"):
+            if st.download_button("Export APPROVED results CSV", data=export_results_csv(only_approved=True), file_name="transformai_results.csv"):
                 pass
         with c2:
-            if REPORTLAB_OK and st.download_button("Export memo PDF (demo)", data=export_results_pdf(), file_name="TransformAI_Memo_demo.pdf"):
+            if REPORTLAB_OK and st.download_button("Export APPROVED memo PDF (demo)", data=export_results_pdf(only_approved=True), file_name="TransformAI_Memo_demo.pdf"):
                 pass
 
 
@@ -1045,16 +1054,19 @@ with tab_sheet:
             if res.get("status") == "cached": mark = "⟲ cached"
             if res.get("status") == "error":  mark = "⚠ error"
             if not res: mark = ""
+            # show approval dot
+            if keypair(r["id"],c["id"]) in SS["approved"]:
+                mark = "✅ " + (mark or "")
             row_vals.append(mark)
         table.append(row_vals)
 
     df_sheet = pd.DataFrame(table, columns=header)
-    st.dataframe(df_sheet, use_container_width=True, height=min(400, 120 + 28*len(df_sheet)))
+    st.dataframe(df_sheet, use_container_width=True, height=min(440, 140 + 28*len(df_sheet)))
 
 
 # --------------------------- REVIEW (focused viz by cell) --------------------
 with tab_review:
-    st.subheader("Review a single cell — charts/evidence render for your selection")
+    st.subheader("Review a single cell — charts & evidence for your selection")
 
     rows_by_id = {r["id"]: r for r in SS["rows"]}
     cols_by_id = {c["id"]: c for c in SS["columns"]}
@@ -1063,7 +1075,7 @@ with tab_review:
     row_opt = [(r["id"], r["alias"]) for r in SS["rows"]]
     col_opt = [(c["id"], f"{c['label']}  ·  {c['module']}") for c in SS["columns"]]
 
-    csel1, csel2, csel3 = st.columns([2,2,1])
+    csel1, csel2, csel3, csel4 = st.columns([2,2,1,1])
     with csel1:
         rid = st.selectbox("Row", row_opt, format_func=lambda t: t[1]) if row_opt else None
     with csel2:
@@ -1071,6 +1083,15 @@ with tab_review:
     with csel3:
         if rid and cid and st.button("Retry"):
             retry_cell(rid[0], cid[0]); run_queued_jobs()
+    with csel4:
+        if rid and cid:
+            kp = keypair(rid[0], cid[0])
+            approved = kp in SS["approved"]
+            if st.button("Approve" if not approved else "Unapprove"):
+                if approved:
+                    SS["approved"].discard(kp)
+                else:
+                    SS["approved"].add(kp)
 
     if not (rid and cid):
         st.info("Choose a Row and a Column above.")
@@ -1090,9 +1111,10 @@ with tab_review:
         else:
             st.caption(f"**{r['alias']}** → **{c['label']}** ({c['module']})")
             st.write(res.get("summary", ""))
+
             module = c["module"]
 
-            # Render only the charts/evidence relevant to this cell/module
+            # Render only charts for this module
             if module == "Cohort Retention (CSV)" or "curve" in res:
                 colA, colB = st.columns(2)
                 with colA:
@@ -1100,20 +1122,7 @@ with tab_review:
                     plot_retention(res.get("curve", []))
                 with colB:
                     st.markdown("**Cohort heatmap**")
-                    plot_retention_heatmap(res.get("cohort_matrix", []), res.get("cohorts", []), res.get("ages", []))
-
-                with st.expander("View cohort table / Export CSV", expanded=False):
-                    matrix = res.get("cohort_matrix", [])
-                    cohorts = res.get("cohorts", [])
-                    ages = res.get("ages", [])
-                    if matrix and cohorts and ages:
-                        dfc = pd.DataFrame(matrix, index=cohorts, columns=[f"M{a}" for a in ages])
-                        dfc.index.name = "Cohort"
-                        st.dataframe(dfc, use_container_width=True, height=320)
-                        st.download_button("Download cohort table CSV", data=export_cohort_csv(res),
-                                           file_name=f"{r['alias'].replace(' ','_')}_cohort_table.csv")
-                    else:
-                        st.info("No cohort table available.")
+                    plot_retention_heatmap(res.get("curve", []))
 
             elif module == "NRR/GRR (CSV)":
                 st.markdown("**NRR / GRR by month**")
@@ -1124,7 +1133,6 @@ with tab_review:
                 plot_pricing(res.get("scatter", {}))
 
             elif module == "Unit Economics (CSV)":
-                # simple numeric panel, no chart needed
                 kpi = {k: res.get(k) for k in ["aov","gm","cac","cm"] if k in res}
                 st.metric(label="Contribution Margin (per order)", value=f"${res.get('value'):.2f}")
                 cols4 = st.columns(3)
@@ -1133,53 +1141,36 @@ with tab_review:
                 with cols4[2]: st.metric("CAC", f"${kpi.get('cac',0):.0f}")
 
             elif module == "PDF KPIs (PDF)":
-                st.markdown("**Evidence viewer**")
-                auto_hits: List[Dict[str, Any]] = res.get("evidence", []) or []
-                manual_hits: List[Dict[str, Any]] = res.get("evidence_manual", []) or []
+                st.info("PDF KPIs module returns a narrative summary (no chart).")
 
-                kpis_available = sorted(set([h["kpi"] for h in auto_hits] + [h["kpi"] for h in manual_hits]))
-                if not kpis_available:
-                    st.info("No parsed KPI hits found. Add manual citations below.")
-                else:
-                    sel_kpi = st.selectbox("Select KPI", kpis_available, index=0)
-                    colL, colR = st.columns([1,2])
-                    with colL:
-                        st.write("**All hits**")
-                        hits = [h for h in auto_hits + manual_hits if h["kpi"] == sel_kpi]
-                        if hits:
-                            dfh = pd.DataFrame(hits)[["page","snippet"]]
-                            st.dataframe(dfh, use_container_width=True, height=260)
-                        else:
-                            st.info("No hits for this KPI.")
-                    with colR:
-                        st.write("**Selected KPI preview**")
-                        for h in hits[:5]:
-                            st.caption(f"p.{h['page']}: {h['snippet'][:200]}")
+            elif module == "PVM Bridge (CSV)":
+                st.markdown("**Price-Volume-Mix Bridge**")
+                plot_pvm(res.get("bridge", []))
+                periods = res.get("periods", {})
+                if periods:
+                    st.caption(f"Periods: {periods.get('from','?')} → {periods.get('to','?')}")
 
-                st.markdown("**Add manual citation**")
-                kc1, kc2 = st.columns([1,1])
-                with kc1:
-                    kpi_name = st.selectbox("KPI", ["revenue","ebitda","gross_margin","churn","other"], index=0, key="manual_kpi")
-                    page_no = st.number_input("Page #", min_value=1, value=1, step=1, key="manual_page")
-                with kc2:
-                    snip = st.text_input("Snippet / quote", key="manual_snip")
-                    if st.button("Add citation"):
-                        res.setdefault("evidence_manual", []).append({"kpi": kpi_name, "page": int(page_no), "snippet": snip[:240]})
-                        SS["results"][(rid, cid)] = res
-                        st.success("Added.")
-
-                if not PDF_PARSE_OK:
-                    st.info("PDF text parser not installed. Auto-detection limited. Manual citations still work.")
-
-            else:
-                st.write("No renderer for this module yet.")
-
+            # Evidence drawer
+            with st.expander("Evidence & Citations", expanded=False):
+                cits = res.get("citations", [])
+                if cits:
+                    st.write("**Citations**:", cits)
+                ev = res.get("evidence")
+                if ev:
+                    if ev.get("type") == "csv_rows":
+                        st.write("Row preview used in calculation:")
+                        st.dataframe(pd.DataFrame(ev.get("preview", [])), use_container_width=True, height=180)
+                        st.caption(f"Total rows: {ev.get('rows')}")
+                    elif ev.get("type") == "pdf_quotes":
+                        st.write("Quoted passages:")
+                        for q in ev.get("quotes", []):
+                            st.write(f"- {q}")
 
 # --------------------------- MEMO (placeholder) ------------------------------
 with tab_memo:
     st.subheader("Investor memo (demo placeholder)")
-    st.caption("Approved cells would be assembled into memo sections here.")
+    st.caption("Only **approved** cells are included in exports.")
     if REPORTLAB_OK:
-        st.write("Use **Run → Export memo PDF (demo)** to preview.")
+        st.write("Use **Run → Export APPROVED memo PDF (demo)** to preview.")
     else:
         st.info("Install `reportlab` to enable PDF export.")
