@@ -229,11 +229,13 @@ MODULES = [
     "Unit Economics (CSV)",
 ]
 
+# *** FIX: include Cohort Retention in QoE template so retention charts appear ***
 QOE_TEMPLATE = [
-    ("PDF KPIs",        "PDF KPIs (PDF)"),
-    ("Unit Economics",  "Unit Economics (CSV)"),
-    ("NRR/GRR",         "NRR/GRR (CSV)"),
-    ("Pricing Power",   "Pricing Power (CSV)"),
+    ("PDF KPIs",         "PDF KPIs (PDF)"),
+    ("Cohort Retention", "Cohort Retention (CSV)"),
+    ("NRR/GRR",          "NRR/GRR (CSV)"),
+    ("Pricing Power",    "Pricing Power (CSV)"),
+    ("Unit Economics",   "Unit Economics (CSV)"),
 ]
 
 def add_rows_from_csvs():
@@ -913,4 +915,3 @@ with tab_memo:
         st.write("Use **Run → Export memo PDF (demo)** to preview.")
     else:
         st.info("Install `reportlab` to enable PDF export.")
-
