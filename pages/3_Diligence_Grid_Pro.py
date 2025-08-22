@@ -1,13 +1,7 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro)
-# Classic grid + CSV schema mapper + Run Plan (QoE template), inline row/column editing,
-# queue/progress, retry, caching, review (with Unit Econ what-ifs), and CSV/PDF export (graceful fallback).
-
+# TransformAI — Diligence Grid (Pro, wide + matrix UI)
 from __future__ import annotations
-import io
-import json
-import time
-import uuid
+import io, json, time, uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,80 +16,62 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# ============================================================
-# ----------------- Session, Utils, Safe Widgets -------------
-# ============================================================
+# Optional charts (plotly for nicer visuals)
+try:
+    import plotly.graph_objs as go
+    from plotly.subplots import make_subplots
+    PLOTLY_OK = True
+except Exception:
+    PLOTLY_OK = False
+
+# -----------------------------------------------------------------------------
+# Page & CSS
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="TransformAI — Diligence Grid (Pro)", layout="wide")
+st.markdown("""
+<style>
+/* widen the content area */
+.block-container {max-width: 1600px !important; padding-top: 1.2rem;}
+/* compact data_editor checkboxes */
+.stDataFrame [role="checkbox"] {transform: scale(1.0);}
+</style>
+""", unsafe_allow_html=True)
 
 SS = st.session_state
 
-def _as_list(x):
-    if x is None: return []
-    if isinstance(x, (list, tuple, set)): return list(x)
-    return [x]
-
-def _keep_only(options, default):
-    opts = set(options or [])
-    return [v for v in _as_list(default) if v in opts]
-
-def ui_selectbox(label, options, default=None, **kwargs):
-    opt_list = list(options or [])
-    dv = _keep_only(opt_list, default)
-    dv = dv[0] if dv else None
-    idx = opt_list.index(dv) if dv in opt_list else (0 if opt_list else None)
-    return st.selectbox(label, opt_list, index=idx, **kwargs)
-
-def ui_multiselect(label, options, default=None, **kwargs):
-    opt_list = list(options or [])
-    dv = _keep_only(opt_list, default)
-    return st.multiselect(label, opt_list, default=dv, **kwargs)
-
-def rerun():
-    st.rerun()
-
-def uid(prefix="row"):
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
-
-def now_ts():
-    return int(time.time())
-
+# -----------------------------------------------------------------------------
+# Helpers / State
+# -----------------------------------------------------------------------------
 def ensure_state():
-    # Data
-    SS.setdefault("csv_files", {})            # {name: DataFrame}
+    SS.setdefault("csv_files", {})            # {name: df}
     SS.setdefault("pdf_files", {})            # {name: bytes}
     SS.setdefault("schema", {})               # {csv_name: {canonical: source_col or None}}
 
-    # Grid
     SS.setdefault("rows", [])                 # [{id, alias, row_type ('table'|'pdf'), source}]
-    SS.setdefault("columns", [])              # [{id, label, module}]
+    SS.setdefault("columns", [])              # [{id, label, module}]  (global columns list)
 
-    # Results + cache
-    SS.setdefault("results", {})              # {(row_id, col_id): {status,value,summary,curve?,last_run,err?}}
-    SS.setdefault("cache_key", {})            # {(row_id,col_id): str}
+    SS.setdefault("matrix", {})               # {row_id: set([module,...])}  // visual mapping
+    SS.setdefault("results", {})              # {(row_id, col_id): {...}}
+    SS.setdefault("cache_key", {})            # {(row_id, col_id): str}
 
-    # Selections
-    SS.setdefault("row_run_selection", [])
-    SS.setdefault("col_run_selection", [])
+    SS.setdefault("jobs", [])                 # queue/history
+    SS.setdefault("force_rerun", False)
 
-    # Queue
-    SS.setdefault("jobs", [])                 # list of {"rid","cid","status","started","ended","note"}
+    SS.setdefault("whatif_gm", 0.62)
+    SS.setdefault("whatif_cac", 42.0)
 
-    # Undo/Redo
     SS.setdefault("undo", [])
     SS.setdefault("redo", [])
 
-    # Stepper
-    SS.setdefault("step_idx", 0)              # 0..4
-
-    # What-ifs (review)
-    SS.setdefault("whatif_gm", 0.62)
-    SS.setdefault("whatif_cac", 42.0)
-    SS.setdefault("force_rerun", False)
-
 ensure_state()
+
+def uid(p="row"): return f"{p}_{uuid.uuid4().hex[:8]}"
+def now_ts(): return int(time.time())
 
 def snapshot_push():
     SS["undo"].append(json.dumps({
-        "rows": SS["rows"], "columns": SS["columns"], "results": SS["results"]
+        "rows": SS["rows"], "columns": SS["columns"], "matrix": {k:list(v) for k,v in SS["matrix"].items()},
+        "results": SS["results"],
     }, default=str))
     SS["redo"].clear()
 
@@ -103,28 +79,30 @@ def snapshot_apply(snap: str):
     data = json.loads(snap)
     SS["rows"]    = data.get("rows", [])
     SS["columns"] = data.get("columns", [])
-    SS["results"] = {tuple(eval(k) if isinstance(k, str) and k.startswith("(") else k): v
-                     for k, v in data.get("results", {}).items()}
+    SS["matrix"]  = {k:set(v) for k,v in data.get("matrix", {}).items()}
+    SS["results"] = {tuple(eval(k) if isinstance(k,str) and k.startswith("(") else k): v
+                     for k,v in data.get("results", {}).items()}
 
 def undo():
     if not SS["undo"]: return
-    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"], "results": SS["results"]}, default=str)
+    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"], "matrix": {k:list(v) for k,v in SS["matrix"].items()},
+                      "results": SS["results"]}, default=str)
     snap = SS["undo"].pop()
     SS["redo"].append(cur)
     snapshot_apply(snap)
 
 def redo():
     if not SS["redo"]: return
-    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"], "results": SS["results"]}, default=str)
+    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"], "matrix": {k:list(v) for k,v in SS["matrix"].items()},
+                      "results": SS["results"]}, default=str)
     snap = SS["redo"].pop()
     SS["undo"].append(cur)
     snapshot_apply(snap)
 
-# ============================================================
-# ---------------------- CSV Schema Map ----------------------
-# ============================================================
-
-CANONICAL = ["customer_id", "order_date", "amount", "price", "quantity", "month", "revenue"]
+# -----------------------------------------------------------------------------
+# Schema
+# -----------------------------------------------------------------------------
+CANONICAL = ["customer_id","order_date","amount","price","quantity","month","revenue"]
 
 def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     cols = {c.lower(): c for c in df.columns}
@@ -145,28 +123,22 @@ def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
 def materialize_df(csv_name: str) -> pd.DataFrame:
     df = SS["csv_files"].get(csv_name, pd.DataFrame()).copy()
     sch = SS["schema"].get(csv_name, {})
-
-    # rename selected mappings → canonical
+    # rename → canonical
     rename_map = {}
-    for k, v in sch.items():
+    for k,v in sch.items():
         if v and v in df.columns and k not in df.columns:
             rename_map[v] = k
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # derive month if missing
+    if rename_map: df = df.rename(columns=rename_map)
+    # derive month
     if "month" not in df.columns and "order_date" in df.columns:
         try:
             df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
             df["month"] = df["order_date"].dt.to_period("M").astype(str)
         except Exception:
             pass
-
-    # derive revenue if missing
+    # derive revenue
     if "revenue" not in df.columns and "amount" in df.columns:
         df["revenue"] = df["amount"]
-
-    # fill quantity/price if missing (soft defaults)
     if "quantity" not in df.columns:
         df["quantity"] = 1
     if "price" not in df.columns:
@@ -175,13 +147,11 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
                 df["price"] = np.where(df["quantity"]>0, df["revenue"]/df["quantity"], np.nan)
         else:
             df["price"] = np.nan
-
     return df
 
-# ============================================================
-# -------------------------- Grid Ops ------------------------
-# ============================================================
-
+# -----------------------------------------------------------------------------
+# Grid helpers
+# -----------------------------------------------------------------------------
 MODULES = [
     "PDF KPIs (PDF)",
     "Cohort Retention (CSV)",
@@ -201,15 +171,17 @@ def add_rows_from_csvs():
     snapshot_push()
     for name in SS["csv_files"].keys():
         if not any(r["source"] == name for r in SS["rows"]):
-            SS["rows"].append({"id": uid("row"), "alias": name.replace(".csv",""),
-                               "row_type":"table", "source": name})
+            rid = uid("row")
+            SS["rows"].append({"id": rid, "alias": name.replace(".csv",""), "row_type":"table", "source": name})
+            SS["matrix"].setdefault(rid, set(["Cohort Retention (CSV)","Pricing Power (CSV)","NRR/GRR (CSV)","Unit Economics (CSV)"]))
 
 def add_rows_from_pdfs():
     snapshot_push()
     for name in SS["pdf_files"].keys():
         if not any(r["source"] == name for r in SS["rows"]):
-            SS["rows"].append({"id": uid("row"), "alias": name.replace(".pdf",""),
-                               "row_type":"pdf", "source": name})
+            rid = uid("row")
+            SS["rows"].append({"id": rid, "alias": name.replace(".pdf",""), "row_type":"pdf", "source": name})
+            SS["matrix"].setdefault(rid, set(["PDF KPIs (PDF)"]))
 
 def add_column(label: str, module: str):
     if not label.strip() or not module: return
@@ -227,20 +199,19 @@ def delete_rows(row_ids: List[str]):
     if not row_ids: return
     snapshot_push()
     SS["rows"] = [r for r in SS["rows"] if r["id"] not in row_ids]
+    for rid in row_ids:
+        SS["matrix"].pop(rid, None)
     SS["results"] = {k:v for k,v in SS["results"].items() if k[0] not in row_ids}
-    SS["row_run_selection"] = _keep_only([r["id"] for r in SS["rows"]], SS["row_run_selection"])
 
 def delete_cols(col_ids: List[str]):
     if not col_ids: return
     snapshot_push()
     SS["columns"] = [c for c in SS["columns"] if c["id"] not in col_ids]
     SS["results"] = {k:v for k,v in SS["results"].items() if k[1] not in col_ids}
-    SS["col_run_selection"] = _keep_only([c["id"] for c in SS["columns"]], SS["col_run_selection"])
 
-# ============================================================
-# ------------------ Mini “Engines” (MVP) --------------------
-# ============================================================
-
+# -----------------------------------------------------------------------------
+# Engines
+# -----------------------------------------------------------------------------
 def _pdf_kpis(_raw: bytes) -> Dict[str, Any]:
     return dict(summary="Revenue ≈ $12.5M; EBITDA ≈ $1.3M; GM ≈ 62%; Churn ≈ 4%")
 
@@ -251,13 +222,12 @@ def _cohort(df: pd.DataFrame) -> Dict[str, Any]:
             d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
             d = d.dropna(subset=["customer_id","order_date"])
             d["month"] = d["order_date"].dt.to_period("M")
-            # naive retention curve (demo)
-            curve = [round(max(0.0, 1.0*(0.9**i)), 2) for i in range(5)]
+            curve = [round(max(0.0, 1.0*(0.9**i)), 2) for i in range(6)]
             m3 = curve[3] if len(curve)>3 else None
             return dict(value=m3, curve=curve, summary=f"Retention stabilizes ~M3 at {m3:.0%} (demo).")
     except Exception:
         pass
-    curve=[1.0,0.86,0.78,0.72,0.69]; m3=0.72
+    curve=[1.0,0.88,0.79,0.72,0.69,0.66]; m3=0.72
     return dict(value=m3, curve=curve, summary=f"Retention stabilizes ~M3 at {m3:.0%} (demo).")
 
 def _pricing(df: pd.DataFrame) -> Dict[str, Any]:
@@ -265,32 +235,41 @@ def _pricing(df: pd.DataFrame) -> Dict[str, Any]:
         d = df[["price","quantity"]].replace(0, np.nan).dropna()
         d = d[(d["price"]>0) & (d["quantity"]>0)]
         x = np.log(d["price"].astype(float)); y = np.log(d["quantity"].astype(float))
-        b = np.polyfit(x,y,1)[0]
+        b, a = np.polyfit(x,y,1)  # y = b*x + a
         e = round(b,2)
         verdict = "inelastic" if abs(e)<1 else "elastic"
-        return dict(value=e, summary=f"Own-price elasticity ≈ {e} → {verdict}.")
+        # For chart
+        fit_y = b*x + a
+        return dict(value=e, summary=f"Own-price elasticity ≈ {e} → {verdict}.",
+                    scatter=dict(x=x.tolist(), y=y.tolist(), fit=fit_y.tolist()))
     except Exception:
         return dict(value=-1.21, summary="Own-price elasticity ≈ -1.21 (demo).")
 
 def _nrr_grr(df: pd.DataFrame) -> Dict[str, Any]:
     try:
-        if "month" not in df.columns and "order_date" in df.columns:
-            df = df.copy()
-            df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
-            df["month"] = df["order_date"].dt.to_period("M").astype(str)
-        if "revenue" not in df.columns and "amount" in df.columns:
-            df["revenue"] = df["amount"]
-        m = df.groupby(["customer_id","month"])["revenue"].sum().reset_index()
+        d = df.copy()
+        if "month" not in d.columns and "order_date" in d.columns:
+            d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
+            d["month"] = d["order_date"].dt.to_period("M").astype(str)
+        if "revenue" not in d.columns and "amount" in d.columns:
+            d["revenue"] = d["amount"]
+        m = d.groupby(["customer_id","month"])["revenue"].sum().reset_index()
         months = sorted(m["month"].unique())
-        if len(months) < 2: return dict(value=0.97, summary="Latest (n/a): GRR 89%, NRR 97% (demo).")
-        prev, cur = months[-2], months[-1]
-        base = m[m["month"]==prev]["revenue"].sum()
-        kept = m[m["month"]==cur]["revenue"].sum()
-        grr = round(min(kept/base,1.2),2) if base else 0.89
-        nrr = round(min((kept+0.05*base)/base,1.3),2) if base else 0.97
-        return dict(value=nrr, summary=f"Latest ({cur}): GRR {grr:.0%}, NRR {nrr:.0%}.")
+        series = []
+        for i in range(1, len(months)):
+            prev, cur = months[i-1], months[i]
+            base = m[m["month"]==prev]["revenue"].sum()
+            kept = m[m["month"]==cur]["revenue"].sum()
+            grr = kept/base if base else 0.89
+            nrr = (kept + 0.05*base)/base if base else 0.97
+            series.append(dict(month=cur, grr=float(np.clip(grr,0,1.2)), nrr=float(np.clip(nrr,0,1.3))))
+        if not series:
+            series=[dict(month="n/a", grr=0.89, nrr=0.97)]
+        latest = series[-1]
+        return dict(value=latest["nrr"], summary=f"Latest ({latest['month']}): GRR {latest['grr']:.0%}, NRR {latest['nrr']:.0%}.",
+                    series=series)
     except Exception:
-        return dict(value=0.97, summary="Latest (demo): GRR 89%, NRR 97%.")
+        return dict(value=0.97, summary="Latest (demo): GRR 89%, NRR 97%.", series=[dict(month="demo", grr=0.89, nrr=0.97)])
 
 def _unit_econ(df: pd.DataFrame, gm: float = 0.62, cac: float = 42.0) -> Dict[str, Any]:
     try:
@@ -302,19 +281,14 @@ def _unit_econ(df: pd.DataFrame, gm: float = 0.62, cac: float = 42.0) -> Dict[st
         return dict(value=32.0, summary="AOV $120.00, GM 60%, CAC $40 → CM $32.00 (demo).",
                     aov=120.0, gm=0.6, cac=40.0, cm=32.0)
 
-# ============================================================
-# ---------------------- Runner & Cache ----------------------
-# ============================================================
-
+# -----------------------------------------------------------------------------
+# Cache/Run
+# -----------------------------------------------------------------------------
 def cache_key_for(row: Dict[str,Any], col: Dict[str,Any]) -> str:
-    # Deterministic cache key: row source + module + schema snapshot
     if row["row_type"] == "pdf":
-        base = f"pdf::{row['source']}::{col['module']}"
-    else:
-        sch = SS["schema"].get(row["source"], {})
-        sch_str = json.dumps(sch, sort_keys=True)
-        base = f"csv::{row['source']}::{col['module']}::{sch_str}"
-    return base
+        return f"pdf::{row['source']}::{col['module']}"
+    sch = SS["schema"].get(row["source"], {})
+    return f"csv::{row['source']}::{col['module']}::{json.dumps(sch, sort_keys=True)}"
 
 def execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
     mod = col["module"]
@@ -336,12 +310,12 @@ def execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
     if mod == "Pricing Power (CSV)":
         df = materialize_df(row["source"])
         k = _pricing(df)
-        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts()}
+        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
 
     if mod == "NRR/GRR (CSV)":
         df = materialize_df(row["source"])
         k = _nrr_grr(df)
-        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts()}
+        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
 
     if mod == "Unit Economics (CSV)":
         df = materialize_df(row["source"])
@@ -350,72 +324,46 @@ def execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
 
     return {"status":"error","value":None,"summary":f"Unknown module: {mod}","last_run": now_ts()}
 
-def enqueue_selection(row_ids: List[str], col_ids: List[str], respect_cache=True):
-    if not row_ids or not col_ids: return
+def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
     by_r = {r["id"]: r for r in SS["rows"]}
     by_c = {c["id"]: c for c in SS["columns"]}
-
-    for rid in row_ids:
-        for cid in col_ids:
-            row = by_r.get(rid); col = by_c.get(cid)
-            if not row or not col: continue
-            key = (rid, cid)
-            ck = cache_key_for(row, col)
-            SS["cache_key"][key] = ck
-            already = SS["results"].get(key)
-            if respect_cache and (already and already.get("status") in {"done","cached"}) and SS["cache_key"].get(key) == ck and not SS["force_rerun"]:
-                # visible cache hit
-                SS["results"][key] = {**already, "status":"cached"}
-                SS["jobs"].append({"rid": rid, "cid": cid, "status":"cached", "started": now_ts(), "ended": now_ts(), "note":"cache"})
-                continue
-            SS["results"][key] = {"status":"queued","value":None,"summary":None}
-            SS["jobs"].append({"rid": rid, "cid": cid, "status":"queued", "started": None, "ended": None, "note":""})
+    for rid, cid in pairs:
+        row = by_r.get(rid); col = by_c.get(cid)
+        if not row or not col: continue
+        key = (rid, cid)
+        ck = cache_key_for(row, col)
+        SS["cache_key"][key] = ck
+        hit = SS["results"].get(key)
+        if respect_cache and (hit and hit.get("status") in {"done","cached"}) and SS["cache_key"].get(key)==ck and not SS["force_rerun"]:
+            SS["results"][key] = {**hit, "status":"cached"}
+            SS["jobs"].append({"rid":rid,"cid":cid,"status":"cached","started":now_ts(),"ended":now_ts(),"note":"cache"})
+            continue
+        SS["results"][key] = {"status":"queued","value":None,"summary":None}
+        SS["jobs"].append({"rid":rid,"cid":cid,"status":"queued","started":None,"ended":None,"note":""})
 
 def run_queued_jobs():
     by_r = {r["id"]: r for r in SS["rows"]}
     by_c = {c["id"]: c for c in SS["columns"]}
-
-    for job in SS["jobs"]:
-        if job["status"] not in {"queued","retry"}:
-            continue
-        rid, cid = job["rid"], job["cid"]
-        row = by_r.get(rid); col = by_c.get(cid)
+    for j in SS["jobs"]:
+        if j["status"] not in {"queued","retry"}: continue
+        rid, cid = j["rid"], j["cid"]
+        row, col = by_r.get(rid), by_c.get(cid)
         if not row or not col:
-            job["status"] = "error"; job["note"] = "row/col missing"; job["ended"] = now_ts()
-            continue
-        job["status"] = "running"; job["started"] = now_ts()
-        key = (rid, cid)
+            j["status"]="error"; j["note"]="row/col missing"; j["ended"]=now_ts(); continue
+        j["status"]="running"; j["started"]=now_ts()
         try:
-            res = execute_cell(row, col)
-            SS["results"][key] = res
-            job["status"] = "done"; job["ended"] = now_ts()
+            SS["results"][(rid,cid)] = execute_cell(row, col)
+            j["status"]="done"; j["ended"]=now_ts()
         except Exception as e:
-            SS["results"][key] = {"status":"error","value":None,"summary":str(e), "last_run": now_ts()}
-            job["status"] = "error"; job["note"] = str(e); job["ended"] = now_ts()
+            SS["results"][(rid,cid)]={"status":"error","value":None,"summary":str(e),"last_run": now_ts()}
+            j["status"]="error"; j["note"]=str(e); j["ended"]=now_ts()
 
 def retry_cell(rid: str, cid: str):
-    SS["jobs"].insert(0, {"rid": rid, "cid": cid, "status":"retry", "started": None, "ended": None, "note":"manual retry"})
+    SS["jobs"].insert(0, {"rid":rid,"cid":cid,"status":"retry","started":None,"ended":None,"note":"manual retry"})
 
-def job_table():
-    if not SS["jobs"]:
-        st.info("No jobs yet. Use Run Plan or Run buttons below.")
-        return
-    rows_by_id = {r["id"]: r for r in SS["rows"]}
-    cols_by_id = {c["id"]: c for c in SS["columns"]}
-    out = []
-    for j in SS["jobs"]:
-        r = rows_by_id.get(j["rid"], {"alias":"(deleted)"})
-        c = cols_by_id.get(j["cid"], {"label":"(deleted)"})
-        out.append(dict(
-            Row=r["alias"], Column=c["label"], Status=j["status"],
-            Started=j["started"], Ended=j["ended"], Note=j.get("note","")
-        ))
-    st.dataframe(pd.DataFrame(out), hide_index=True, use_container_width=True)
-
-# ============================================================
-# ---------------------- Export Helpers ----------------------
-# ============================================================
-
+# -----------------------------------------------------------------------------
+# Exports
+# -----------------------------------------------------------------------------
 def export_results_csv() -> bytes:
     rows_by_id = {r["id"]: r for r in SS["rows"]}
     cols_by_id = {c["id"]: c for c in SS["columns"]}
@@ -424,351 +372,368 @@ def export_results_csv() -> bytes:
         r = rows_by_id.get(rid); c = cols_by_id.get(cid)
         if not r or not c: continue
         out.append(dict(
-            row_id=rid, row_alias=r["alias"], row_type=r["row_type"], source=r["source"],
-            col_id=cid, col_label=c["label"], module=c["module"],
-            status=res.get("status"), value=res.get("value"), summary=res.get("summary"),
-            last_run=res.get("last_run")
+            row=r["alias"], row_type=r["row_type"], source=r["source"],
+            column=c["label"], module=c["module"],
+            status=res.get("status"), value=res.get("value"), summary=res.get("summary"), last_run=res.get("last_run")
         ))
-    df = pd.DataFrame(out)
-    return df.to_csv(index=False).encode("utf-8")
+    return pd.DataFrame(out).to_csv(index=False).encode("utf-8")
 
 def export_results_pdf() -> bytes:
-    if not REPORTLAB_OK:
-        raise RuntimeError("ReportLab not installed")
+    if not REPORTLAB_OK: raise RuntimeError("reportlab not installed")
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER)
-    width, height = LETTER
+    w,h = LETTER
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(72, height-72, "TransformAI — QoE Summary (Demo)")
-    c.setFont("Helvetica", 10)
-    y = height - 100
+    c.drawString(72, h-72, "TransformAI — QoE Summary (Demo)")
+    y = h-100; c.setFont("Helvetica", 10)
     rows_by_id = {r["id"]: r for r in SS["rows"]}
-    cols_by_id = {c2["id"]: c2 for c2 in SS["columns"]}
-    for (rid, cid), res in list(SS["results"].items())[:28]:
+    cols_by_id = {c["id"]: c for c in SS["columns"]}
+    for (rid,cid),res in list(SS["results"].items())[:28]:
         r = rows_by_id.get(rid); cdef = cols_by_id.get(cid)
         if not r or not cdef: continue
         line = f"{r['alias']} → {cdef['label']}: {res.get('summary')}"
-        for chunk in [line[i:i+95] for i in range(0, len(line), 95)]:
-            if y < 72:
-                c.showPage(); y = height-72; c.setFont("Helvetica", 10)
-            c.drawString(72, y, chunk)
-            y -= 14
-    c.showPage(); c.save()
-    buf.seek(0)
+        for chunk in [line[i:i+95] for i in range(0,len(line),95)]:
+            if y<72: c.showPage(); y=h-72; c.setFont("Helvetica",10)
+            c.drawString(72,y,chunk); y-=14
+    c.showPage(); c.save(); buf.seek(0)
     return buf.getvalue()
 
-# ============================================================
-# --------------------------- UI -----------------------------
-# ============================================================
-
+# -----------------------------------------------------------------------------
+# UI — Tabs (wide)
+# -----------------------------------------------------------------------------
 st.title("Transform AI — Diligence Grid (Pro)")
-# Stepper (fallback to radio if segmented_control missing)
-try:
-    steps = ["Data", "Grid", "Run", "Review", "Memo"]
-    SS["step_idx"] = st.segmented_control("Workflow", steps, selection=steps[SS.get("step_idx", 0)], key="seg_steps")
-except Exception:
-    steps = ["Data", "Grid", "Run", "Review", "Memo"]
-    SS["step_idx"] = steps.index(st.radio("Workflow", steps, index=SS.get("step_idx", 0), horizontal=True))
+tab_data, tab_grid, tab_run, tab_review, tab_memo = st.tabs(["Data","Grid","Run","Review","Memo"])
 
-# ------------------------- DATA -----------------------------
-if SS["step_idx"] == 0:
-    st.subheader("1) Evidence Sources & CSV Schema")
+# --------------------------- DATA ---------------------------
+with tab_data:
+    st.subheader("Evidence Sources & CSV Schema")
 
     c1, c2 = st.columns(2)
     with c1:
-        csv_files = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True)
-        if csv_files:
-            for f in csv_files:
-                try:
-                    df = pd.read_csv(f)
-                except Exception:
-                    df = pd.read_csv(io.BytesIO(f.getvalue()))
+        csvs = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True)
+        if csvs:
+            for f in csvs:
+                try: df = pd.read_csv(f)
+                except Exception: df = pd.read_csv(io.BytesIO(f.getvalue()))
                 SS["csv_files"][f.name] = df
                 SS["schema"].setdefault(f.name, _auto_guess_schema(df))
-            st.success(f"Loaded {len(csv_files)} CSV file(s).")
+            st.success(f"Loaded {len(csvs)} CSV file(s).")
 
     with c2:
-        pdf_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-        if pdf_files:
-            for f in pdf_files:
+        pdfs = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+        if pdfs:
+            for f in pdfs:
                 SS["pdf_files"][f.name] = f.getvalue()
-            st.success(f"Loaded {len(pdf_files)} PDF file(s).")
+            st.success(f"Loaded {len(pdfs)} PDF file(s).")
 
-    with st.expander("Drive/Box/SharePoint Link (stub)", expanded=False):
-        link = st.text_input("Paste a public/shared link (ends with .csv or .pdf)")
-        fname = st.text_input("Save as (e.g., data.csv or pack.pdf)")
-        if st.button("Fetch & add"):
-            try:
-                import requests
-                r = requests.get(link, timeout=15)
-                r.raise_for_status()
-                if fname.lower().endswith(".csv"):
-                    SS["csv_files"][fname] = pd.read_csv(io.BytesIO(r.content))
-                    SS["schema"].setdefault(fname, _auto_guess_schema(SS["csv_files"][fname]))
-                    st.success(f"Fetched CSV: {fname}")
-                elif fname.lower().endswith(".pdf"):
-                    SS["pdf_files"][fname] = r.content
-                    st.success(f"Fetched PDF: {fname}")
-                else:
-                    st.error("File extension must be .csv or .pdf")
-            except Exception as e:
-                st.error(f"Fetch failed: {e}")
+    with st.expander("Map CSV Schema (click to edit)", expanded=True if SS["csv_files"] else False):
+        for name, df in SS["csv_files"].items():
+            st.markdown(f"**{name}**")
+            sch = SS["schema"].setdefault(name, _auto_guess_schema(df))
+            cols = ["— None —"] + list(df.columns)
+            def pick(lbl, key):
+                cur = sch.get(key)
+                if cur not in df.columns: cur = None
+                idx = cols.index(cur) if cur in cols else 0
+                val = st.selectbox(lbl, cols, index=idx, key=f"{name}:{key}")
+                sch[key] = None if val == "— None —" else val
+            pick("Customer ID", "customer_id")
+            pick("Order Date", "order_date")
+            pick("Amount", "amount")
+            pick("Unit Price", "price")
+            pick("Quantity", "quantity")
+            pick("Month (YYYY-MM)", "month")
+            pick("Revenue (period revenue)", "revenue")
+            st.divider()
 
-    if SS["csv_files"]:
-        with st.expander("Map CSV Schema (per file)", expanded=True):
-            for name, df in SS["csv_files"].items():
-                st.markdown(f"**{name}**")
-                sch = SS["schema"].setdefault(name, _auto_guess_schema(df))
-                cols = ["— None —"] + list(df.columns)
+    st.write("**Loaded CSVs:**", list(SS["csv_files"].keys()) or "—")
+    st.write("**Loaded PDFs:**", list(SS["pdf_files"].keys()) or "—")
 
-                def pick(lbl, key):
-                    current = sch.get(key)
-                    if current not in df.columns: current = None
-                    chosen = ui_selectbox(lbl, cols, default=current if current else "— None —", key=f"{name}:{key}")
-                    sch[key] = None if chosen == "— None —" else chosen
+# --------------------------- GRID ---------------------------
+with tab_grid:
+    st.subheader("Build Grid: rows, columns, and the Matrix Board")
 
-                pick("Customer ID", "customer_id")
-                pick("Order Date (timestamp)", "order_date")
-                pick("Amount (txn value)", "amount")
-                pick("Unit Price", "price")
-                pick("Quantity", "quantity")
-                pick("Month (YYYY-MM)", "month")
-                pick("Revenue (period revenue)", "revenue")
-                st.divider()
-    else:
-        st.info("Upload at least one CSV to map schema.")
-
-    st.write("**Loaded CSVs**:", list(SS["csv_files"].keys()) or "—")
-    st.write("**Loaded PDFs**:", list(SS["pdf_files"].keys()) or "—")
-
-# ------------------------- GRID -----------------------------
-if SS["step_idx"] == 1:
-    st.subheader("2) Build Grid")
-
-    # Top actions
-    b1, b2, b3, b4 = st.columns([1,1,1,1])
-    with b1:
+    a1, a2, a3, a4 = st.columns([1,1,1,1])
+    with a1:
         if st.button("Add rows from CSVs", use_container_width=True):
-            add_rows_from_csvs(); st.toast("CSV rows added"); rerun()
-    with b2:
+            add_rows_from_csvs(); st.toast("CSV rows added")
+    with a2:
         if st.button("Add rows from PDFs", use_container_width=True):
-            add_rows_from_pdfs(); st.toast("PDF rows added"); rerun()
-    with b3:
+            add_rows_from_pdfs(); st.toast("PDF rows added")
+    with a3:
         if st.button("Add QoE Columns", use_container_width=True):
-            add_template_columns(QOE_TEMPLATE); st.toast("QoE columns added"); rerun()
-    with b4:
-        if st.button("Undo / Redo help", use_container_width=True):
-            st.info("Use the Undo/Redo buttons below to revert structural changes.")
+            add_template_columns(QOE_TEMPLATE); st.toast("QoE columns added")
+    with a4:
+        if st.button("Undo / Redo", use_container_width=True):
+            if SS["undo"]: undo(); st.toast("Undone")  # one tap undo
 
     c3, c4 = st.columns([1,1])
     with c3:
-        if st.button("Undo", use_container_width=True): undo(); rerun()
+        if st.button("Redo", use_container_width=True): 
+            if SS["redo"]: redo(); st.toast("Redone")
     with c4:
-        if st.button("Redo", use_container_width=True): redo(); rerun()
+        pass
 
-    # Inline row editor
-    st.markdown("**Rows (inline editable)**")
+    # Inline Rows
+    st.markdown("**Rows**")
     if SS["rows"]:
         df_rows = pd.DataFrame(SS["rows"])[["id","alias","row_type","source"]]
-        df_rows_display = df_rows.copy()
-        df_rows_display["delete"] = False
+        df_rows_display = df_rows.copy(); df_rows_display["delete"] = False
         edited = st.data_editor(
             df_rows_display,
-            hide_index=True,
-            use_container_width=True,
-            disabled=["id","row_type","source"],
-            key="rows_editor"
+            hide_index=True, use_container_width=True,
+            disabled=["id","row_type","source"], key="rows_editor_grid"
         )
-        del_selection = edited[edited["delete"] == True]["id"].tolist()
-        if st.button("Apply row changes"):
-            # Apply alias edits
+        dels = edited[edited["delete"]==True]["id"].tolist()
+        if st.button("Apply row edits / deletes", use_container_width=True):
             alias_map = {row["id"]: row["alias"] for _, row in edited.iterrows()}
-            for r in SS["rows"]:
-                r["alias"] = alias_map.get(r["id"], r["alias"])
-            # Deletes
-            if del_selection:
-                delete_rows(del_selection)
-            st.success("Rows updated"); rerun()
-    else:
-        st.info("No rows yet. Use the buttons above to add from CSV/PDF.")
+            for r in SS["rows"]: r["alias"] = alias_map.get(r["id"], r["alias"])
+            if dels: delete_rows(dels)
+            st.success("Rows updated")
 
-    # Inline column editor
-    st.markdown("**Columns (inline editable)**")
+    else:
+        st.info("No rows yet. Add from CSVs/PDFs.")
+
+    # Inline Columns
+    st.markdown("**Columns**")
     if SS["columns"]:
         df_cols = pd.DataFrame(SS["columns"])[["id","label","module"]]
-        df_cols_display = df_cols.copy()
-        df_cols_display["delete"] = False
-        edited_cols = st.data_editor(
+        df_cols_display = df_cols.copy(); df_cols_display["delete"] = False
+        edc = st.data_editor(
             df_cols_display,
-            hide_index=True,
-            use_container_width=True,
-            disabled=["id","module"],  # you can allow module edits if you want
-            key="cols_editor"
+            hide_index=True, use_container_width=True,
+            disabled=["id","module"], key="cols_editor_grid"
         )
-        del_cols = edited_cols[edited_cols["delete"] == True]["id"].tolist()
-        if st.button("Apply column changes"):
-            # Apply label edits
-            label_map = {row["id"]: row["label"] for _, row in edited_cols.iterrows()}
-            for c in SS["columns"]:
-                c["label"] = label_map.get(c["id"], c["label"])
-            # Deletes
-            if del_cols:
-                delete_cols(del_cols)
-            st.success("Columns updated"); rerun()
+        delc = edc[edc["delete"]==True]["id"].tolist()
+        if st.button("Apply column edits / deletes", use_container_width=True):
+            label_map = {row["id"]: row["label"] for _, row in edc.iterrows()}
+            for c in SS["columns"]: c["label"] = label_map.get(c["id"], c["label"])
+            if delc: delete_cols(delc)
+            st.success("Columns updated")
     else:
-        st.info("No columns yet. Add QoE columns or a custom one below.")
+        st.caption("No columns yet. Add QoE Columns or create one below.")
 
-    st.markdown("**Add a single column**")
-    ac1, ac2, ac3 = st.columns([2,2,1])
-    with ac1:
-        new_label = st.text_input("Column label", value=SS.get("new_col_label","NRR/GRR"))
+    # New column
+    nc1, nc2, nc3 = st.columns([2,2,1])
+    with nc1:
+        new_label = st.text_input("New column label", value=SS.get("new_col_label","NRR/GRR"))
         SS["new_col_label"] = new_label
-    with ac2:
-        new_mod = ui_selectbox("Module", MODULES, default=SS.get("new_col_mod","NRR/GRR (CSV)"))
+    with nc2:
+        new_mod = st.selectbox("Module", MODULES, index=MODULES.index(SS.get("new_col_mod","NRR/GRR (CSV)")) if SS.get("new_col_mod","NRR/GRR (CSV)") in MODULES else 3)
         SS["new_col_mod"] = new_mod
-    with ac3:
+    with nc3:
         if st.button("Add Column", use_container_width=True):
-            add_column(SS["new_col_label"], SS["new_col_mod"]); st.success("Column added"); rerun()
+            add_column(SS["new_col_label"], SS["new_col_mod"]); st.success("Column added")
 
-# -------------------------- RUN -----------------------------
-if SS["step_idx"] == 2:
-    st.subheader("3) Run")
+    st.divider()
+    st.markdown("### Matrix Board — map **rows ↔ modules** (what should run where)")
 
+    if SS["rows"]:
+        # Build matrix df: one row per grid row, boolean columns for each module
+        base = []
+        rid_by_alias = {}
+        for r in SS["rows"]:
+            rid_by_alias[r["alias"]] = r["id"]
+            sel = SS["matrix"].setdefault(r["id"], set())
+            base.append({
+                "row_id": r["id"], "Alias": r["alias"], "Type": r["row_type"],
+                "PDF KPIs (PDF)": "PDF KPIs (PDF)" in sel,
+                "Cohort Retention (CSV)": "Cohort Retention (CSV)" in sel,
+                "Pricing Power (CSV)": "Pricing Power (CSV)" in sel,
+                "NRR/GRR (CSV)": "NRR/GRR (CSV)" in sel,
+                "Unit Economics (CSV)": "Unit Economics (CSV)" in sel,
+            })
+        mdf = pd.DataFrame(base)
+        mdf_edit = st.data_editor(
+            mdf,
+            column_config={
+                "PDF KPIs (PDF)": st.column_config.CheckboxColumn(),
+                "Cohort Retention (CSV)": st.column_config.CheckboxColumn(),
+                "Pricing Power (CSV)": st.column_config.CheckboxColumn(),
+                "NRR/GRR (CSV)": st.column_config.CheckboxColumn(),
+                "Unit Economics (CSV)": st.column_config.CheckboxColumn(),
+            },
+            hide_index=True, use_container_width=True, key="matrix_editor"
+        )
+        if st.button("Apply Matrix", use_container_width=True):
+            snapshot_push()
+            for _, row in mdf_edit.iterrows():
+                rid = row["row_id"]
+                sel = set()
+                for mod in MODULES:
+                    if mod in row and bool(row[mod]): sel.add(mod)
+                # enforce type compatibility
+                if any(r["id"]==rid and r["row_type"]=="pdf" for r in SS["rows"]):
+                    sel = set(m for m in sel if m=="PDF KPIs (PDF)")
+                SS["matrix"][rid] = sel
+            st.success("Matrix updated")
+
+    else:
+        st.info("Add rows first, then use the Matrix to map modules.")
+
+# --------------------------- RUN ----------------------------
+with tab_run:
+    st.subheader("Run — queue, process, and see status")
     st.toggle("Force re-run (ignore cache)", key="force_rerun", value=SS.get("force_rerun", False))
 
-    with st.expander("Run Plan & Templates", expanded=True):
-        plan = st.radio("Template", ["QoE (one-click)", "Custom selection"], horizontal=True)
-        if plan.startswith("QoE"):
-            st.caption("Adds QoE columns (if missing), selects **all rows**, and runs everything in one click.")
-            if st.button("Apply QoE & Run All", type="primary"):
-                add_template_columns(QOE_TEMPLATE)
-                row_ids = [r["id"] for r in SS["rows"]]
-                col_ids = [c["id"] for c in SS["columns"] if (c["label"], c["module"]) in QOE_TEMPLATE]
-                SS["row_run_selection"] = row_ids
-                SS["col_run_selection"] = col_ids
-                enqueue_selection(row_ids, col_ids, respect_cache=True)
+    # One-click QoE
+    with st.expander("One-click QoE", expanded=True):
+        st.caption("Adds QoE columns (if missing), selects mapped pairs from Matrix, runs all.")
+        if st.button("Run QoE Now", type="primary"):
+            add_template_columns(QOE_TEMPLATE)
+            # build pairs from matrix
+            by_label_mod = {(c["label"], c["module"]): c["id"] for c in SS["columns"]}
+            pairs = []
+            for r in SS["rows"]:
+                rid = r["id"]
+                sel = SS["matrix"].get(rid, set())
+                for label, mod in QOE_TEMPLATE:
+                    if mod in sel and (label,mod) in by_label_mod:
+                        pairs.append((rid, by_label_mod[(label,mod)]))
+            enqueue_pairs(pairs, respect_cache=True)
+            run_queued_jobs()
+            st.success(f"Ran {len(pairs)} cell(s).")
+
+    # Manual selection by Matrix
+    with st.expander("Manual run by Matrix selection", expanded=False):
+        rows = SS["rows"]
+        cols = SS["columns"]
+        by_mod = {c["module"]: c["id"] for c in cols}
+        options = []
+        for r in rows:
+            sel = SS["matrix"].get(r["id"], set())
+            for mod in sel:
+                cid = by_mod.get(mod)
+                if cid:
+                    options.append((r["id"], cid, f"{r['alias']} → {mod}"))
+        if options:
+            labels = [o[2] for o in options]
+            picks = st.multiselect("Pick cell pairs to run", options=list(range(len(options))), default=list(range(len(options)))[:8], format_func=lambda i: labels[i])
+            if st.button("Queue + Run selection"):
+                pairs = [(options[i][0], options[i][1]) for i in picks]
+                enqueue_pairs(pairs, respect_cache=True)
                 run_queued_jobs()
-                rerun()
+                st.success(f"Ran {len(pairs)} cell(s).")
         else:
-            st.caption("Pick any rows and columns below, preview the queue, then run.")
+            st.info("No mapped pairs in Matrix yet.")
 
-        st.markdown("**Job Queue / History**")
-        job_table()
-
-    # Custom selectors
-    st.markdown("**Custom Run**")
-    row_ids = [r["id"] for r in SS["rows"]]
-    col_ids = [c["id"] for c in SS["columns"]]
-    SS["row_run_selection"] = ui_multiselect("Rows", options=row_ids, default=SS.get("row_run_selection", []))
-    SS["col_run_selection"] = ui_multiselect("Columns", options=col_ids, default=SS.get("col_run_selection", []))
-
-    rc1, rc2, rc3 = st.columns([1,1,1])
-    with rc1:
-        if st.button("Queue selection", use_container_width=True):
-            enqueue_selection(SS["row_run_selection"], SS["col_run_selection"], respect_cache=True)
-            st.toast("Selection queued"); rerun()
-    with rc2:
-        if st.button("Run queued now", use_container_width=True, type="primary"):
-            run_queued_jobs(); st.toast("Queue processed"); rerun()
-    with rc3:
-        if st.button("Clear queue", use_container_width=True):
-            SS["jobs"].clear(); st.toast("Queue cleared"); rerun()
-
-    # Results table (status/last run)
-    st.markdown("**Results (investor view)**")
-    rows_by_id = {r["id"]: r for r in SS["rows"]}
-    cols_by_id = {c["id"]: c for c in SS["columns"]}
-    table = []
-    for (rid, cid), res in SS["results"].items():
-        r = rows_by_id.get(rid); c = cols_by_id.get(cid)
-        if not r or not c: continue
-        status = res.get("status")
-        emoji = {"done":"✅","cached":"🟢","queued":"⏳","running":"🟡","error":"🔴","needs_review":"🟠"}.get(status, "•")
-        table.append(dict(
-            Row=r["alias"], Column=c["label"], Module=c["module"],
-            Status=f"{emoji} {status}", Value=res.get("value"), Summary=res.get("summary"),
-            LastRun=res.get("last_run")
-        ))
-    if table:
-        st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+    # Job table
+    if SS["jobs"]:
+        rows_by_id = {r["id"]: r for r in SS["rows"]}
+        cols_by_id = {c["id"]: c for c in SS["columns"]}
+        out=[]
+        for j in SS["jobs"]:
+            r=rows_by_id.get(j["rid"],{"alias":"(deleted)"})
+            c=cols_by_id.get(j["cid"],{"label":"(deleted)"})
+            out.append(dict(Row=r["alias"], Column=c["label"], Status=j["status"], Started=j["started"], Ended=j["ended"], Note=j.get("note","")))
+        st.dataframe(pd.DataFrame(out), hide_index=True, use_container_width=True)
     else:
-        st.info("No results yet. Queue & run a selection or use QoE one-click.")
+        st.info("No jobs yet.")
 
-# ------------------------- REVIEW ---------------------------
-if SS["step_idx"] == 3:
-    st.subheader("4) Review & What-ifs")
-
-    rows_by_id = {r["id"]: r for r in SS["rows"]}
-    cols_by_id = {c["id"]: c for c in SS["columns"]}
-    keys = list(SS["results"].keys())
-    if not keys:
-        st.info("No cell results yet.")
+    # Results snapshot
+    st.markdown("**Results snapshot**")
+    if SS["results"]:
+        rows_by_id = {r["id"]: r for r in SS["rows"]}
+        cols_by_id = {c["id"]: c for c in SS["columns"]}
+        tbl=[]
+        for (rid,cid),res in SS["results"].items():
+            r=rows_by_id.get(rid); c=cols_by_id.get(cid)
+            if not r or not c: continue
+            status=res.get("status"); emoji={"done":"✅","cached":"🟢","queued":"⏳","running":"🟡","error":"🔴","needs_review":"🟠"}.get(status,"•")
+            tbl.append(dict(Row=r["alias"], Column=c["label"], Module=c["module"], Status=f"{emoji} {status}", Value=res.get("value"), Summary=res.get("summary")))
+        st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
     else:
-        labels = []
-        for (rid, cid) in keys:
-            r = rows_by_id.get(rid, {"alias":rid})
-            c = cols_by_id.get(cid, {"label":cid})
-            status = SS["results"][(rid,cid)].get("status")
-            emoji = {"done":"✅","cached":"🟢","queued":"⏳","running":"🟡","error":"🔴","needs_review":"🟠"}.get(status, "•")
-            labels.append(f"{emoji} {r['alias']} → {c['label']}")
-        idx = ui_selectbox("Pick a cell", list(range(len(keys))), default=0,
-                           format_func=lambda i: labels[i] if 0 <= i < len(labels) else "—")
-        rid, cid = keys[idx]
-        res = SS["results"].get((rid,cid), {})
+        st.caption("Run something to populate results.")
+
+# -------------------------- REVIEW --------------------------
+with tab_review:
+    st.subheader("Review — inspect a single cell with charts & what-ifs")
+
+    if not SS["results"]:
+        st.info("No results yet.")
+    else:
+        rows_by_id = {r["id"]: r for r in SS["rows"]}
+        cols_by_id = {c["id"]: c for c in SS["columns"]}
+        keys = list(SS["results"].keys())
+        labels=[]
+        for (rid,cid) in keys:
+            r=rows_by_id.get(rid,{"alias":rid}); c=cols_by_id.get(cid,{"label":cid,"module":"?"})
+            status=SS["results"][(rid,cid)].get("status")
+            emoji={"done":"✅","cached":"🟢","queued":"⏳","running":"🟡","error":"🔴","needs_review":"🟠"}.get(status,"•")
+            labels.append(f"{emoji} {r['alias']} → {c['label']} ({c['module']})")
+        idx = st.selectbox("Pick result", list(range(len(keys))), index=0, format_func=lambda i: labels[i])
+        rid,cid = keys[idx]
+        res = SS["results"].get((rid,cid),{})
+        col_def = cols_by_id.get(cid,{}); row_def = rows_by_id.get(rid,{})
+
         st.write("**Status**:", res.get("status"))
         st.write("**Summary**:", res.get("summary") or "—")
-        if "curve" in res:
-            st.write("Average Retention Curve")
+
+        # Charts
+        if col_def.get("module") == "Cohort Retention (CSV)" and "curve" in res:
             curve = res["curve"]
-            chart_df = pd.DataFrame({"x": list(range(len(curve))), "y": curve})
-            st.line_chart(chart_df, x="x", y="y", height=240)
+            if PLOTLY_OK:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=list(range(len(curve))), y=curve, mode="lines+markers", name="Retention"))
+                fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.line_chart(pd.DataFrame({"x":range(len(curve)),"y":curve}).set_index("x"))
 
-        # Unit Econ what-ifs (visible for Unit Economics)
-        col_def = cols_by_id.get(cid, {})
+        if col_def.get("module") == "Pricing Power (CSV)" and "scatter" in res and PLOTLY_OK:
+            sc = res["scatter"]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=sc["x"], y=sc["y"], mode="markers", name="log(q) vs log(p)"))
+            fig.add_trace(go.Scatter(x=sc["x"], y=sc["fit"], mode="lines", name="fit"))
+            fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10), xaxis_title="log(price)", yaxis_title="log(quantity)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if col_def.get("module") == "NRR/GRR (CSV)" and "series" in res and PLOTLY_OK:
+            s = res["series"]
+            fig = make_subplots(rows=1, cols=1)
+            fig.add_trace(go.Bar(x=[r["month"] for r in s], y=[r["grr"] for r in s], name="GRR"))
+            fig.add_trace(go.Scatter(x=[r["month"] for r in s], y=[r["nrr"] for r in s], mode="lines+markers", name="NRR"))
+            fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10), yaxis_tickformat=".0%")
+            st.plotly_chart(fig, use_container_width=True)
+
         if col_def.get("module") == "Unit Economics (CSV)":
-            st.markdown("**What-ifs (Unit Economics)**")
-            c1, c2 = st.columns(2)
+            st.markdown("**What-ifs**")
+            c1,c2 = st.columns(2)
             with c1:
-                SS["whatif_gm"] = st.slider("Gross Margin %", 0.2, 0.9, SS.get("whatif_gm", 0.62), 0.01)
+                SS["whatif_gm"] = st.slider("Gross Margin %", 0.2, 0.9, SS.get("whatif_gm",0.62), 0.01)
             with c2:
-                SS["whatif_cac"] = st.slider("CAC ($)", 0.0, 200.0, SS.get("whatif_cac", 42.0), 1.0)
-            # Recompute this cell with what-ifs (temp display)
-            row = rows_by_id.get(rid)
-            if row:
-                df = materialize_df(row["source"])
-                k = _unit_econ(df, gm=SS["whatif_gm"], cac=SS["whatif_cac"])
-                st.info(f"What-if → {k['summary']}")
+                SS["whatif_cac"] = st.slider("CAC ($)", 0.0, 200.0, SS.get("whatif_cac",42.0), 1.0)
+            # temp recompute
+            df = materialize_df(row_def["source"]) if row_def.get("row_type")=="table" else pd.DataFrame()
+            k = _unit_econ(df, gm=SS["whatif_gm"], cac=SS["whatif_cac"])
+            st.info(f"What-if → {k['summary']}")
+            if PLOTLY_OK:
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=["AOV","CAC","CM"], y=[k["aov"], k["cac"], k["cm"]]))
+                fig.update_layout(height=280, margin=dict(l=10,r=10,t=30,b=10))
+                st.plotly_chart(fig, use_container_width=True)
 
-        cc1, cc2, cc3 = st.columns([1,1,1])
-        with cc1:
-            if st.button("Retry this cell", use_container_width=True):
-                retry_cell(rid, cid); run_queued_jobs(); st.success("Retried."); rerun()
-        with cc2:
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
+            if st.button("Retry", use_container_width=True):
+                retry_cell(rid,cid); run_queued_jobs(); st.success("Retried.")
+        with c2:
             if st.button("Mark needs_review", use_container_width=True):
-                SS["results"][(rid,cid)]["status"] = "needs_review"; st.toast("Marked as needs_review"); rerun()
-        with cc3:
+                SS["results"][(rid,cid)]["status"]="needs_review"; st.toast("Marked.")
+        with c3:
             if st.button("Clear needs_review", use_container_width=True):
-                if SS["results"][(rid,cid)].get("status") == "needs_review":
-                    SS["results"][(rid,cid)]["status"] = "done"; st.toast("Marked as done"); rerun()
+                if SS["results"][(rid,cid)].get("status")=="needs_review":
+                    SS["results"][(rid,cid)]["status"]="done"; st.toast("Cleared.")
 
-# -------------------------- MEMO ----------------------------
-if SS["step_idx"] == 4:
-    st.subheader("5) Memo / Export")
-
-    # CSV export
-    out_csv = export_results_csv() if SS["results"] else None
-    if out_csv:
-        st.download_button("Download Results (CSV)", out_csv, file_name="transformai_results.csv", mime="text/csv")
+# --------------------------- MEMO ---------------------------
+with tab_memo:
+    st.subheader("Memo / Export")
+    if SS["results"]:
+        st.download_button("Download Results (CSV)", export_results_csv(), file_name="transformai_results.csv", mime="text/csv")
+        if REPORTLAB_OK:
+            try:
+                st.download_button("Download QoE Summary (PDF)", export_results_pdf(), file_name="TransformAI_QoE_Summary.pdf", mime="application/pdf")
+            except Exception as e:
+                st.warning(f"PDF export unavailable: {e}")
     else:
-        st.info("No results yet to export.")
-
-    # Simple PDF export (summary page)
-    if REPORTLAB_OK and SS["results"]:
-        try:
-            pdf_bytes = export_results_pdf()
-            st.download_button("Download QoE Summary (PDF)", pdf_bytes, file_name="TransformAI_QoE_Summary.pdf", mime="application/pdf")
-            st.caption("PDF is a compact summary of the current grid results (demo format).")
-        except Exception as e:
-            st.warning(f"PDF export unavailable: {e}")
-    elif not REPORTLAB_OK:
-        st.caption("Install reportlab to enable PDF export: pip install reportlab")
+        st.info("Run some cells to export.")
