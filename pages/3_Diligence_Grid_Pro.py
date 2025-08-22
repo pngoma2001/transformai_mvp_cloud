@@ -1,5 +1,5 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro, wide + matrix UI)
+# TransformAI — Diligence Grid (Pro, wide + matrix UI + Agentic Spreadsheet)
 from __future__ import annotations
 import io, json, time, uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,7 +16,7 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# Optional charts (plotly for nicer visuals)
+# Plotly for charts
 try:
     import plotly.graph_objs as go
     from plotly.subplots import make_subplots
@@ -30,9 +30,7 @@ except Exception:
 st.set_page_config(page_title="TransformAI — Diligence Grid (Pro)", layout="wide")
 st.markdown("""
 <style>
-/* widen the content area */
-.block-container {max-width: 1600px !important; padding-top: 1.2rem;}
-/* compact data_editor checkboxes */
+.block-container {max-width: 1600px !important; padding-top: 1.0rem;}
 .stDataFrame [role="checkbox"] {transform: scale(1.0);}
 </style>
 """, unsafe_allow_html=True)
@@ -48,13 +46,13 @@ def ensure_state():
     SS.setdefault("schema", {})               # {csv_name: {canonical: source_col or None}}
 
     SS.setdefault("rows", [])                 # [{id, alias, row_type ('table'|'pdf'), source}]
-    SS.setdefault("columns", [])              # [{id, label, module}]  (global columns list)
+    SS.setdefault("columns", [])              # [{id, label, module}]
+    SS.setdefault("matrix", {})               # {row_id: set([module,...])}
 
-    SS.setdefault("matrix", {})               # {row_id: set([module,...])}  // visual mapping
     SS.setdefault("results", {})              # {(row_id, col_id): {...}}
     SS.setdefault("cache_key", {})            # {(row_id, col_id): str}
 
-    SS.setdefault("jobs", [])                 # queue/history
+    SS.setdefault("jobs", [])
     SS.setdefault("force_rerun", False)
 
     SS.setdefault("whatif_gm", 0.62)
@@ -70,7 +68,8 @@ def now_ts(): return int(time.time())
 
 def snapshot_push():
     SS["undo"].append(json.dumps({
-        "rows": SS["rows"], "columns": SS["columns"], "matrix": {k:list(v) for k,v in SS["matrix"].items()},
+        "rows": SS["rows"], "columns": SS["columns"],
+        "matrix": {k:list(v) for k,v in SS["matrix"].items()},
         "results": SS["results"],
     }, default=str))
     SS["redo"].clear()
@@ -85,7 +84,8 @@ def snapshot_apply(snap: str):
 
 def undo():
     if not SS["undo"]: return
-    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"], "matrix": {k:list(v) for k,v in SS["matrix"].items()},
+    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"],
+                      "matrix": {k:list(v) for k,v in SS["matrix"].items()},
                       "results": SS["results"]}, default=str)
     snap = SS["undo"].pop()
     SS["redo"].append(cur)
@@ -93,14 +93,15 @@ def undo():
 
 def redo():
     if not SS["redo"]: return
-    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"], "matrix": {k:list(v) for k,v in SS["matrix"].items()},
+    cur = json.dumps({"rows": SS["rows"], "columns": SS["columns"],
+                      "matrix": {k:list(v) for k,v in SS["matrix"].items()},
                       "results": SS["results"]}, default=str)
     snap = SS["redo"].pop()
     SS["undo"].append(cur)
     snapshot_apply(snap)
 
 # -----------------------------------------------------------------------------
-# Schema
+# Schema helpers
 # -----------------------------------------------------------------------------
 CANONICAL = ["customer_id","order_date","amount","price","quantity","month","revenue"]
 
@@ -123,7 +124,7 @@ def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
 def materialize_df(csv_name: str) -> pd.DataFrame:
     df = SS["csv_files"].get(csv_name, pd.DataFrame()).copy()
     sch = SS["schema"].get(csv_name, {})
-    # rename → canonical
+    # rename to canonical
     rename_map = {}
     for k,v in sch.items():
         if v and v in df.columns and k not in df.columns:
@@ -139,6 +140,7 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
     # derive revenue
     if "revenue" not in df.columns and "amount" in df.columns:
         df["revenue"] = df["amount"]
+    # ensure quantity & price
     if "quantity" not in df.columns:
         df["quantity"] = 1
     if "price" not in df.columns:
@@ -238,7 +240,6 @@ def _pricing(df: pd.DataFrame) -> Dict[str, Any]:
         b, a = np.polyfit(x,y,1)  # y = b*x + a
         e = round(b,2)
         verdict = "inelastic" if abs(e)<1 else "elastic"
-        # For chart
         fit_y = b*x + a
         return dict(value=e, summary=f"Own-price elasticity ≈ {e} → {verdict}.",
                     scatter=dict(x=x.tolist(), y=y.tolist(), fit=fit_y.tolist()))
@@ -399,10 +400,12 @@ def export_results_pdf() -> bytes:
     return buf.getvalue()
 
 # -----------------------------------------------------------------------------
-# UI — Tabs (wide)
+# UI — Tabs
 # -----------------------------------------------------------------------------
 st.title("Transform AI — Diligence Grid (Pro)")
-tab_data, tab_grid, tab_run, tab_review, tab_memo = st.tabs(["Data","Grid","Run","Review","Memo"])
+tab_data, tab_grid, tab_run, tab_sheet, tab_review, tab_memo = st.tabs(
+    ["Data","Grid","Run","Sheet","Review","Memo"]
+)
 
 # --------------------------- DATA ---------------------------
 with tab_data:
@@ -464,17 +467,13 @@ with tab_grid:
         if st.button("Add QoE Columns", use_container_width=True):
             add_template_columns(QOE_TEMPLATE); st.toast("QoE columns added")
     with a4:
-        if st.button("Undo / Redo", use_container_width=True):
-            if SS["undo"]: undo(); st.toast("Undone")  # one tap undo
+        if st.button("Undo", use_container_width=True):
+            if SS["undo"]: undo(); st.toast("Undone")
 
-    c3, c4 = st.columns([1,1])
-    with c3:
-        if st.button("Redo", use_container_width=True): 
-            if SS["redo"]: redo(); st.toast("Redone")
-    with c4:
-        pass
+    if st.button("Redo", use_container_width=True):
+        if SS["redo"]: redo(); st.toast("Redone")
 
-    # Inline Rows
+    # Inline rows
     st.markdown("**Rows**")
     if SS["rows"]:
         df_rows = pd.DataFrame(SS["rows"])[["id","alias","row_type","source"]]
@@ -490,11 +489,10 @@ with tab_grid:
             for r in SS["rows"]: r["alias"] = alias_map.get(r["id"], r["alias"])
             if dels: delete_rows(dels)
             st.success("Rows updated")
-
     else:
         st.info("No rows yet. Add from CSVs/PDFs.")
 
-    # Inline Columns
+    # Inline columns
     st.markdown("**Columns**")
     if SS["columns"]:
         df_cols = pd.DataFrame(SS["columns"])[["id","label","module"]]
@@ -529,11 +527,9 @@ with tab_grid:
     st.markdown("### Matrix Board — map **rows ↔ modules** (what should run where)")
 
     if SS["rows"]:
-        # Build matrix df: one row per grid row, boolean columns for each module
+        # Build matrix df
         base = []
-        rid_by_alias = {}
         for r in SS["rows"]:
-            rid_by_alias[r["alias"]] = r["id"]
             sel = SS["matrix"].setdefault(r["id"], set())
             base.append({
                 "row_id": r["id"], "Alias": r["alias"], "Type": r["row_type"],
@@ -562,12 +558,11 @@ with tab_grid:
                 sel = set()
                 for mod in MODULES:
                     if mod in row and bool(row[mod]): sel.add(mod)
-                # enforce type compatibility
-                if any(r["id"]==rid and r["row_type"]=="pdf" for r in SS["rows"]):
+                # type guard: PDF row → only PDF KPIs
+                if any(rr["id"]==rid and rr["row_type"]=="pdf" for rr in SS["rows"]):
                     sel = set(m for m in sel if m=="PDF KPIs (PDF)")
                 SS["matrix"][rid] = sel
             st.success("Matrix updated")
-
     else:
         st.info("Add rows first, then use the Matrix to map modules.")
 
@@ -581,7 +576,6 @@ with tab_run:
         st.caption("Adds QoE columns (if missing), selects mapped pairs from Matrix, runs all.")
         if st.button("Run QoE Now", type="primary"):
             add_template_columns(QOE_TEMPLATE)
-            # build pairs from matrix
             by_label_mod = {(c["label"], c["module"]): c["id"] for c in SS["columns"]}
             pairs = []
             for r in SS["rows"]:
@@ -594,10 +588,9 @@ with tab_run:
             run_queued_jobs()
             st.success(f"Ran {len(pairs)} cell(s).")
 
-    # Manual selection by Matrix
+    # Manual by Matrix
     with st.expander("Manual run by Matrix selection", expanded=False):
-        rows = SS["rows"]
-        cols = SS["columns"]
+        rows = SS["rows"]; cols = SS["columns"]
         by_mod = {c["module"]: c["id"] for c in cols}
         options = []
         for r in rows:
@@ -630,20 +623,105 @@ with tab_run:
     else:
         st.info("No jobs yet.")
 
-    # Results snapshot
-    st.markdown("**Results snapshot**")
-    if SS["results"]:
-        rows_by_id = {r["id"]: r for r in SS["rows"]}
-        cols_by_id = {c["id"]: c for c in SS["columns"]}
-        tbl=[]
-        for (rid,cid),res in SS["results"].items():
-            r=rows_by_id.get(rid); c=cols_by_id.get(cid)
-            if not r or not c: continue
-            status=res.get("status"); emoji={"done":"✅","cached":"🟢","queued":"⏳","running":"🟡","error":"🔴","needs_review":"🟠"}.get(status,"•")
-            tbl.append(dict(Row=r["alias"], Column=c["label"], Module=c["module"], Status=f"{emoji} {status}", Value=res.get("value"), Summary=res.get("summary")))
-        st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
+# ---------------------- SHEET (agentic) --------------------
+def _status_emoji(s: Optional[str]) -> str:
+    return {
+        "done":"✅","cached":"🟢","queued":"⏳","running":"🟡",
+        "error":"🔴","needs_review":"🟠"
+    }.get(s or "", "•")
+
+with tab_sheet:
+    st.subheader("Sheet — Agentic Spreadsheet")
+    rows = SS["rows"]; cols = SS["columns"]
+    if not rows or not cols:
+        st.info("Add rows & columns first.")
     else:
-        st.caption("Run something to populate results.")
+        rows_by_id = {r["id"]: r for r in rows}
+        cols_by_id = {c["id"]: c for c in cols}
+
+        # Build display matrix (rows=aliases, columns=column labels)
+        aliases = [r["alias"] for r in rows]
+        labels  = [c["label"] for c in cols]
+        matrix_df = pd.DataFrame(index=aliases, columns=labels)
+        for r in rows:
+            sel = SS["matrix"].get(r["id"], set())
+            for c in cols:
+                cell_text = "—"
+                mapped = (c["module"] in sel)
+                if mapped:
+                    res = SS["results"].get((r["id"], c["id"]))
+                    if res:
+                        val = res.get("value")
+                        val_txt = ""
+                        if isinstance(val,(int,float)) and pd.notna(val):
+                            # keep short
+                            val_txt = f" {val:.2f}"
+                        cell_text = f"{_status_emoji(res.get('status'))}{val_txt}"
+                    else:
+                        cell_text = "•"
+                matrix_df.at[r["alias"], c["label"]] = cell_text
+
+        st.caption("Legend: ✅ done, 🟢 cached, ⏳ queued, 🟡 running, 🟠 needs review, 🔴 error, • mapped/no result, — not mapped")
+        st.dataframe(matrix_df.fillna("—"), use_container_width=True, height=420)
+
+        st.markdown("**Cell controls**")
+        c1,c2,c3,c4 = st.columns([2,2,1,1])
+        with c1:
+            sel_row = st.selectbox("Row", aliases)
+        with c2:
+            sel_col = st.selectbox("Column", labels)
+        # resolve ids
+        rid = next(r["id"] for r in rows if r["alias"]==sel_row)
+        cid = next(c["id"] for c in cols if c["label"]==sel_col)
+
+        c_left, c_mid, c_right = st.columns([1,1,2])
+        with c_left:
+            if st.button("▶️ Run cell", use_container_width=True):
+                enqueue_pairs([(rid,cid)], respect_cache=True)
+                run_queued_jobs()
+                st.success("Cell executed.")
+        with c_mid:
+            if st.button("↻ Retry cell", use_container_width=True):
+                retry_cell(rid,cid); run_queued_jobs(); st.success("Retried.")
+        with c_right:
+            a,b = st.columns(2)
+            with a:
+                if st.button("Mark needs_review", use_container_width=True):
+                    SS["results"].setdefault((rid,cid),{}); SS["results"][(rid,cid)]["status"]="needs_review"; st.toast("Marked.")
+            with b:
+                if st.button("Clear needs_review", use_container_width=True):
+                    if SS["results"].get((rid,cid),{}).get("status")=="needs_review":
+                        SS["results"][(rid,cid)]["status"]="done"; st.toast("Cleared.")
+
+        st.markdown("**Batch controls**")
+        b1,b2,b3 = st.columns([1,1,2])
+        # Run entire row (mapped cols)
+        if b1.button("Run row (mapped)", use_container_width=True):
+            sel = SS["matrix"].get(rid, set())
+            pairs = [(rid, c["id"]) for c in cols if c["module"] in sel]
+            enqueue_pairs(pairs, respect_cache=True); run_queued_jobs()
+            st.success(f"Ran {len(pairs)} cell(s) for row.")
+        # Run entire column (mapped rows)
+        if b2.button("Run column (mapped)", use_container_width=True):
+            mod = next(c["module"] for c in cols if c["id"]==cid)
+            pairs=[]
+            for r in rows:
+                if mod in SS["matrix"].get(r["id"], set()):
+                    pairs.append((r["id"], cid))
+            enqueue_pairs(pairs, respect_cache=True); run_queued_jobs()
+            st.success(f"Ran {len(pairs)} cell(s) for column.")
+        # Run all uncomputed (mapped)
+        if b3.button("Run all (mapped & uncomputed)", use_container_width=True):
+            pairs=[]
+            for r in rows:
+                sel = SS["matrix"].get(r["id"], set())
+                for c in cols:
+                    if c["module"] in sel:
+                        res = SS["results"].get((r["id"], c["id"]))
+                        if not res or res.get("status") not in {"done","cached","needs_review"}:
+                            pairs.append((r["id"], c["id"]))
+            enqueue_pairs(pairs, respect_cache=True); run_queued_jobs()
+            st.success(f"Ran {len(pairs)} cell(s).")
 
 # -------------------------- REVIEW --------------------------
 with tab_review:
@@ -703,7 +781,6 @@ with tab_review:
                 SS["whatif_gm"] = st.slider("Gross Margin %", 0.2, 0.9, SS.get("whatif_gm",0.62), 0.01)
             with c2:
                 SS["whatif_cac"] = st.slider("CAC ($)", 0.0, 200.0, SS.get("whatif_cac",42.0), 1.0)
-            # temp recompute
             df = materialize_df(row_def["source"]) if row_def.get("row_type")=="table" else pd.DataFrame()
             k = _unit_econ(df, gm=SS["whatif_gm"], cac=SS["whatif_cac"])
             st.info(f"What-if → {k['summary']}")
@@ -712,18 +789,6 @@ with tab_review:
                 fig.add_trace(go.Bar(x=["AOV","CAC","CM"], y=[k["aov"], k["cac"], k["cm"]]))
                 fig.update_layout(height=280, margin=dict(l=10,r=10,t=30,b=10))
                 st.plotly_chart(fig, use_container_width=True)
-
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            if st.button("Retry", use_container_width=True):
-                retry_cell(rid,cid); run_queued_jobs(); st.success("Retried.")
-        with c2:
-            if st.button("Mark needs_review", use_container_width=True):
-                SS["results"][(rid,cid)]["status"]="needs_review"; st.toast("Marked.")
-        with c3:
-            if st.button("Clear needs_review", use_container_width=True):
-                if SS["results"][(rid,cid)].get("status")=="needs_review":
-                    SS["results"][(rid,cid)]["status"]="done"; st.toast("Cleared.")
 
 # --------------------------- MEMO ---------------------------
 with tab_memo:
