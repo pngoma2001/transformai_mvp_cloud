@@ -1,7 +1,9 @@
-# 3_diligence_.py
-# TransformAI — Agentic Diligence Spreadsheet (Hardcore Features)
-# - Approvals, Provenance (CSV + PDF), Memo composer, Parallel engine
-# - New modules: Churn by Segment, PVM Bridge
+# pages/3_Diligence_Grid_Pro.py
+# TransformAI — Agentic Diligence Spreadsheet (Hardcore, Thread-Safe)
+# - Parallel engine with thread-safe snapshots
+# - Approvals & provenance (CSV + PDF)
+# - Memo composer (MD + PDF)
+# - Modules: Retention, NRR/GRR, Pricing Power, Unit Econ, PDF KPIs, Churn by Segment, PVM Bridge
 
 from __future__ import annotations
 import io, json, time, uuid, re, math
@@ -23,16 +25,16 @@ except Exception:
 # Optional PDF text readers (for KPI citations)
 _PDF_BACKENDS = {}
 try:
-    import PyPDF2  # type: ignore
-    _PDF_BACKENDS["pypdf2"] = True
-except Exception:
-    _PDF_BACKENDS["pypdf2"] = False
-
-try:
     import pdfplumber  # type: ignore
     _PDF_BACKENDS["pdfplumber"] = True
 except Exception:
     _PDF_BACKENDS["pdfplumber"] = False
+
+try:
+    import PyPDF2  # type: ignore
+    _PDF_BACKENDS["pypdf2"] = True
+except Exception:
+    _PDF_BACKENDS["pypdf2"] = False
 
 # Plot libs
 try:
@@ -51,19 +53,18 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="TransformAI — Diligence Grid (Hardcore)", layout="wide")
+st.set_page_config(page_title="TransformAI — Diligence Grid", layout="wide")
 st.markdown(
     """
 <style>
 .block-container {max-width: 1700px !important; padding-top: .5rem;}
 h1, .stMarkdown h1 { white-space: normal !important; overflow-wrap: anywhere !important; line-height: 1.15 !important; margin-top: .25rem !important; }
 .stDataFrame [role="checkbox"] {transform: scale(1.0);}
-.prov {font-size: 0.9rem; color: #555;}
+.small {font-size: 0.9rem; color: #666;}
 </style>
 """,
     unsafe_allow_html=True,
 )
-
 SS = st.session_state
 
 
@@ -81,6 +82,7 @@ def ensure_state():
     SS.setdefault("results", {})              # {(row_id, col_id): {...}}
     SS.setdefault("cache_key", {})            # {(row_id, col_id): str}
     SS.setdefault("approvals", {})            # {(row_id, col_id): bool}
+
     SS.setdefault("jobs", [])                 # [{rid,cid,status,...}]
     SS.setdefault("force_rerun", False)
     SS.setdefault("parallel", True)
@@ -219,7 +221,6 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
             df["price"] = np.nan
     # fill segment if missing
     if "segment" not in df.columns:
-        # basic derived segmentation by revenue quartiles per customer
         if "customer_id" in df.columns and "revenue" in df.columns:
             cust_rev = df.groupby("customer_id")["revenue"].sum().reset_index()
             q = cust_rev["revenue"].quantile([0.33, 0.66]).tolist()
@@ -242,7 +243,7 @@ MODULES = [
     "Pricing Power (CSV)",
     "Unit Economics (CSV)",
     "Churn by Segment (CSV)",
-    "PVM Bridge (CSV)",  # Price-Volume-Mix revenue bridge (last 2 months)
+    "PVM Bridge (CSV)",
 ]
 
 QOE_TEMPLATE = [
@@ -300,6 +301,23 @@ def delete_cols(col_ids: List[str]):
     SS["approvals"] = {k:v for k,v in SS["approvals"].items() if k[1] not in col_ids}
 
 
+# Provenance helpers ----------------------------------------------------------
+def _with_provenance(df: pd.DataFrame, rows_idx: np.ndarray, preview_cols: Optional[List[str]]=None) -> Dict[str, Any]:
+    rows_idx = np.asarray(rows_idx, dtype=int) if len(rows_idx) else np.array([], dtype=int)
+    rows_idx = rows_idx[:50]  # cap preview
+    preview = pd.DataFrame()
+    if len(rows_idx) and len(df.index):
+        try:
+            preview = df.iloc[rows_idx]
+            if preview_cols:
+                keep = [c for c in preview_cols if c in preview.columns]
+                if keep: preview = preview[keep]
+        except Exception:
+            preview = pd.DataFrame()
+    prov = dict(row_indices=rows_idx.tolist(), preview=preview.to_dict(orient="records"))
+    return prov
+
+
 # Engines (calculations) -----------------------------------------------------
 def _pdf_extract_kpis(raw: bytes) -> Dict[str, Any]:
     """
@@ -324,7 +342,6 @@ def _pdf_extract_kpis(raw: bytes) -> Dict[str, Any]:
 
     found = {}
     cites = []
-    # regex patterns (very forgiving)
     patterns = {
         "Revenue": r"(Revenue|Sales)[^\d\-]*([\$]?\s?\d[\d,\.]+)",
         "EBITDA":  r"(EBITDA)[^\d\-]*([\$]?\s?\d[\d,\.]+)",
@@ -350,26 +367,10 @@ def _pdf_extract_kpis(raw: bytes) -> Dict[str, Any]:
             summary="Revenue ≈ $12.5M; EBITDA ≈ $1.3M; GM ≈ 62%; Churn ≈ 4% (demo)"
         )
 
-    # Build summary
     parts = []
     for k in ["Revenue","EBITDA","GM","Churn"]:
         if k in found: parts.append(f"{k} {found[k]}")
     return dict(kpis=found, citations=cites, summary="; ".join(parts))
-
-def _with_provenance(df: pd.DataFrame, rows_idx: np.ndarray, preview_cols: Optional[List[str]]=None) -> Dict[str, Any]:
-    rows_idx = np.asarray(rows_idx, dtype=int) if len(rows_idx) else np.array([], dtype=int)
-    rows_idx = rows_idx[:50]  # cap preview
-    preview = pd.DataFrame()
-    if len(rows_idx) and len(df.index):
-        try:
-            preview = df.iloc[rows_idx]
-            if preview_cols:
-                keep = [c for c in preview_cols if c in preview.columns]
-                if keep: preview = preview[keep]
-        except Exception:
-            preview = pd.DataFrame()
-    prov = dict(row_indices=rows_idx.tolist(), preview=preview.to_dict(orient="records"))
-    return prov
 
 def _cohort(df: pd.DataFrame) -> Dict[str, Any]:
     try:
@@ -378,7 +379,6 @@ def _cohort(df: pd.DataFrame) -> Dict[str, Any]:
             d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
             d = d.dropna(subset=["customer_id","order_date"])
             d["month"] = d["order_date"].dt.to_period("M").astype(str)
-            # simple survival by month since first order
             first = d.groupby("customer_id")["month"].min()
             d = d.join(first, on="customer_id", rsuffix="_first")
             d["age"] = pd.PeriodIndex(d["month"]).to_timestamp() - pd.PeriodIndex(d["month_first"]).to_timestamp()
@@ -431,7 +431,6 @@ def _nrr_grr(df: pd.DataFrame) -> Dict[str, Any]:
             base = m[m["month"]==prev]["revenue"].sum()
             kept = m[m["month"]==cur]["revenue"].sum()
             grr = kept/base if base else 0.0
-            # assume +5% net expansion from upsell for demo; clamp
             nrr = (kept + 0.05*base)/base if base else 0.0
             series.append(dict(month=cur, grr=float(np.clip(grr,0,1.2)), nrr=float(np.clip(nrr,0,1.3))))
             prov_rows.extend(m.index[(m["month"].isin([prev,cur]))].tolist())
@@ -492,7 +491,6 @@ def _churn_by_segment(df: pd.DataFrame) -> Dict[str, Any]:
             out.append(dict(segment=s, churn=float(round(rate,4)), base=base, churned=churned))
             prov_rows.extend(d.index[(d["month"].isin([t0,t1])) & (d["segment"]==s)].tolist())
         prov = _with_provenance(d, rows_idx=np.array(prov_rows[:200]), preview_cols=["customer_id","segment","month","revenue"])
-        # summary
         msg = ", ".join([f"{r['segment']}: {r['churn']:.0%}" for r in out])
         return dict(table=out, value=max((1-x["churn"]) for x in out) if out else None, summary=f"Churn by segment (last period): {msg}.", provenance=prov)
     except Exception as e:
@@ -501,7 +499,6 @@ def _churn_by_segment(df: pd.DataFrame) -> Dict[str, Any]:
 def _pvm_bridge(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Price-Volume-Mix revenue bridge between last two months.
-    Uses grouping by product (or segment, or customer_id fallback).
     ΔRev = Σ(p1q1 - p0q0) = Σ((p1-p0)q0) + Σ(p0(q1-q0)) + Σ((p1-p0)(q1-q0))
     """
     try:
@@ -532,56 +529,100 @@ def _pvm_bridge(df: pd.DataFrame) -> Dict[str, Any]:
         return dict(value=None, summary=f"PVM bridge not available ({e}).", table=[], provenance={})
 
 
-# Cache/Run ------------------------------------------------------------------
+# ------------------ Thread-safe engine (NO session_state in workers) --------
+def _make_engine_snapshot():
+    return dict(
+        rows_by_id={r["id"]: r for r in SS.get("rows", [])},
+        cols_by_id={c["id"]: c for c in SS.get("columns", [])},
+        csv_files=SS.get("csv_files", {}),
+        pdf_files=SS.get("pdf_files", {}),
+        schema=SS.get("schema", {}),
+        whatif=dict(gm=SS.get("whatif_gm", 0.62), cac=SS.get("whatif_cac", 42.0)),
+    )
+
+def _materialize_df_from_snapshot(csv_name, snap):
+    df = snap["csv_files"].get(csv_name, pd.DataFrame()).copy()
+    sch = snap["schema"].get(csv_name, {})
+    rename_map = {}
+    for k, v in sch.items():
+        if v and v in df.columns and k not in df.columns:
+            rename_map[v] = k
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    if "month" not in df.columns and "order_date" in df.columns:
+        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+        df["month"] = df["order_date"].dt.to_period("M").astype(str)
+    if "revenue" not in df.columns and "amount" in df.columns:
+        df["revenue"] = df["amount"]
+    if "quantity" not in df.columns:
+        df["quantity"] = 1
+    if "price" not in df.columns:
+        if "revenue" in df.columns and "quantity" in df.columns:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                df["price"] = np.where(df["quantity"] > 0, df["revenue"] / df["quantity"], np.nan)
+        else:
+            df["price"] = np.nan
+    if "segment" not in df.columns:
+        if "customer_id" in df.columns and "revenue" in df.columns:
+            cust_rev = df.groupby("customer_id")["revenue"].sum().reset_index()
+            q = cust_rev["revenue"].quantile([0.33, 0.66]).tolist()
+            seg_map = {}
+            for _, r in cust_rev.iterrows():
+                if r["revenue"] <= q[0]: seg_map[r["customer_id"]] = "SMB"
+                elif r["revenue"] <= q[1]: seg_map[r["customer_id"]] = "Mid"
+                else: seg_map[r["customer_id"]] = "Enterprise"
+            df["segment"] = df["customer_id"].map(seg_map)
+        else:
+            df["segment"] = "All"
+    return df
+
+def _run_job_snapshot(rid: str, cid: str, snap: dict):
+    by_r = snap["rows_by_id"]; by_c = snap["cols_by_id"]
+    row, col = by_r.get(rid), by_c.get(cid)
+    if not row or not col:
+        return ("error", {"status":"error","value":None,"summary":"row/col missing","last_run": now_ts()})
+    mod = col["module"]
+    try:
+        if row["row_type"] == "pdf":
+            if mod != "PDF KPIs (PDF)":
+                return ("done", {"status":"done","value":None,"summary":"PDF module required for a PDF row.","last_run": now_ts(), "provenance":{}})
+            raw = snap["pdf_files"].get(row["source"], b"")
+            k = _pdf_extract_kpis(raw)
+            return ("done", {"status":"done","value":None,"summary":k["summary"],"last_run": now_ts(), "citations": k.get("citations",[]), "kpis":k.get("kpis",{})})
+
+        df = _materialize_df_from_snapshot(row["source"], snap)
+
+        if mod == "Cohort Retention (CSV)":
+            k = _cohort(df); out = {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), "provenance": k.get("provenance",{})}
+            if "curve" in k: out["curve"] = k["curve"]
+            return ("done", out)
+        if mod == "Pricing Power (CSV)":
+            k = _pricing(df)
+            return ("done", {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k})
+        if mod == "NRR/GRR (CSV)":
+            k = _nrr_grr(df)
+            return ("done", {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k})
+        if mod == "Unit Economics (CSV)":
+            k = _unit_econ(df, gm=snap["whatif"]["gm"], cac=snap["whatif"]["cac"])
+            return ("done", {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k})
+        if mod == "Churn by Segment (CSV)":
+            k = _churn_by_segment(df)
+            return ("done", {"status":"done","value":k.get("value"),"summary":k["summary"],"last_run": now_ts(), **k})
+        if mod == "PVM Bridge (CSV)":
+            k = _pvm_bridge(df)
+            return ("done", {"status":"done","value":k.get("value"),"summary":k["summary"],"last_run": now_ts(), **k})
+
+        return ("error", {"status":"error","value":None,"summary":f"Unknown module: {mod}","last_run": now_ts()})
+    except Exception as e:
+        return ("error", {"status":"error","value":None,"summary":str(e),"last_run": now_ts()})
+
+
+# Cache/Run orchestration ----------------------------------------------------
 def cache_key_for(row: Dict[str,Any], col: Dict[str,Any]) -> str:
     if row["row_type"] == "pdf":
         return f"pdf::{row['source']}::{col['module']}"
     sch = SS["schema"].get(row["source"], {})
     return f"csv::{row['source']}::{col['module']}::{json.dumps(sch, sort_keys=True)}"
-
-def _execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
-    mod = col["module"]
-    if row["row_type"] == "pdf" and mod != "PDF KPIs (PDF)":
-        return {"status":"done","value":None,"summary":"PDF module required for a PDF row.","last_run": now_ts(), "provenance":{}}
-
-    if mod == "PDF KPIs (PDF)":
-        raw = SS["pdf_files"].get(row["source"], b"")
-        k = _pdf_extract_kpis(raw)
-        return {"status":"done","value":None,"summary":k["summary"],"last_run": now_ts(), "citations": k.get("citations",[]), "kpis":k.get("kpis",{})}
-
-    if mod == "Cohort Retention (CSV)":
-        df = materialize_df(row["source"])
-        k = _cohort(df)
-        out = {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), "provenance": k.get("provenance",{})}
-        if "curve" in k: out["curve"] = k["curve"]
-        return out
-
-    if mod == "Pricing Power (CSV)":
-        df = materialize_df(row["source"])
-        k = _pricing(df)
-        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
-
-    if mod == "NRR/GRR (CSV)":
-        df = materialize_df(row["source"])
-        k = _nrr_grr(df)
-        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
-
-    if mod == "Unit Economics (CSV)":
-        df = materialize_df(row["source"])
-        k = _unit_econ(df, gm=SS.get("whatif_gm",0.62), cac=SS.get("whatif_cac",42.0))
-        return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
-
-    if mod == "Churn by Segment (CSV)":
-        df = materialize_df(row["source"])
-        k = _churn_by_segment(df)
-        return {"status":"done","value":k.get("value"),"summary":k["summary"],"last_run": now_ts(), **k}
-
-    if mod == "PVM Bridge (CSV)":
-        df = materialize_df(row["source"])
-        k = _pvm_bridge(df)
-        return {"status":"done","value":k.get("value"),"summary":k["summary"],"last_run": now_ts(), **k}
-
-    return {"status":"error","value":None,"summary":f"Unknown module: {mod}","last_run": now_ts()}
 
 def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
     by_r = {r["id"]: r for r in SS["rows"]}
@@ -600,30 +641,18 @@ def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
         SS["results"][key] = {"status":"queued","value":None,"summary":None}
         SS["jobs"].append({"rid":rid,"cid":cid,"status":"queued","started":None,"ended":None,"note":""})
 
-def _run_job(rid: str, cid: str):
-    by_r = {r["id"]: r for r in SS["rows"]}
-    by_c = {c["id"]: c for c in SS["columns"]}
-    row, col = by_r.get(rid), by_c.get(cid)
-    if not row or not col:
-        return ("error", {"status":"error","value":None,"summary":"row/col missing","last_run": now_ts()})
-    try:
-        res = _execute_cell(row, col)
-        return ("done", res)
-    except Exception as e:
-        return ("error", {"status":"error","value":None,"summary":str(e),"last_run": now_ts()})
-
 def run_queued_jobs():
-    # Collect queued/retry
     tasks = [(j["rid"], j["cid"]) for j in SS["jobs"] if j["status"] in {"queued","retry"}]
-    # Mark started
     for j in SS["jobs"]:
         if j["status"] in {"queued","retry"}:
             j["status"]="running"; j["started"]=now_ts()
-    if not tasks: return
+    if not tasks:
+        return
 
+    snap = _make_engine_snapshot()
     if SS.get("parallel", True):
         with ThreadPoolExecutor(max_workers=max(1, int(SS.get("max_workers",4)))) as ex:
-            futures = {ex.submit(_run_job, rid, cid):(rid,cid) for (rid,cid) in tasks}
+            futures = {ex.submit(_run_job_snapshot, rid, cid, snap):(rid,cid) for (rid,cid) in tasks}
             for fut in as_completed(futures):
                 rid, cid = futures[fut]
                 status, res = fut.result()
@@ -633,7 +662,7 @@ def run_queued_jobs():
                         j["status"]=status; j["ended"]=now_ts()
     else:
         for rid, cid in tasks:
-            status, res = _run_job(rid, cid)
+            status, res = _run_job_snapshot(rid, cid, snap)
             SS["results"][(rid,cid)] = res
             for j in SS["jobs"]:
                 if j["rid"]==rid and j["cid"]==cid and j["status"]=="running":
@@ -704,7 +733,6 @@ def export_memo_pdf() -> bytes:
     if not REPORTLAB_OK:
         raise RuntimeError("reportlab not installed")
     md = export_memo_markdown()
-    # Tiny text-only PDF renderer
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER)
     w,h = LETTER
@@ -712,7 +740,6 @@ def export_memo_pdf() -> bytes:
     y = h - 36
     for para in md.split("\n"):
         line = para.replace("\t","    ")
-        # wrap at ~95 chars
         parts = [line[i:i+95] for i in range(0,len(line),95)] or [""]
         for chunk in parts:
             if y < 36:
@@ -785,7 +812,7 @@ def plot_pricing(scatter: Dict[str, Any]):
 
 
 # UI -------------------------------------------------------------------------
-st.title("TransformAI — Agentic Diligence Spreadsheet (Hardcore)")
+st.title("TransformAI — Agentic Diligence Spreadsheet")
 
 tab_data, tab_grid, tab_run, tab_sheet, tab_review, tab_memo = st.tabs(
     ["Data","Grid","Run","Sheet","Review","Memo"]
@@ -941,7 +968,6 @@ with tab_grid:
                 sel = set()
                 for mod in MODULES:
                     if mod in row and bool(row[mod]): sel.add(mod)
-                # PDF guard
                 if any(rr["id"]==rid and rr["row_type"]=="pdf" for rr in SS["rows"]):
                     sel = set(m for m in sel if m=="PDF KPIs (PDF)")
                 SS["matrix"][rid] = sel
@@ -996,7 +1022,6 @@ with tab_run:
             st.info("Nothing mapped in Matrix yet.")
 
     st.divider()
-    # Jobs + quick exports
     if SS["jobs"]:
         st.markdown("**Jobs**")
         st.dataframe(pd.DataFrame(SS["jobs"]), use_container_width=True, height=180)
@@ -1016,7 +1041,6 @@ with tab_run:
 # SHEET (Agentic Spreadsheet) ------------------------------------------------
 with tab_sheet:
     st.subheader("Agentic Spreadsheet (status by cell)")
-
     qoe_cols = [c for c in SS["columns"] if c["module"] in {m for _,m in QOE_TEMPLATE}] or SS["columns"]
     header = ["Row"] + [c["label"] for c in qoe_cols]
     table = []
@@ -1034,7 +1058,6 @@ with tab_sheet:
                 if SS["approvals"].get((r["id"], c["id"]), False): mark = "✅ " + (str(res.get("value")) if res.get("value") is not None else "")
             row_vals.append(mark)
         table.append(row_vals)
-
     df_sheet = pd.DataFrame(table, columns=header)
     st.dataframe(df_sheet, use_container_width=True, height=min(420, 120 + 28*len(df_sheet)))
 
@@ -1087,7 +1110,7 @@ with tab_review:
                     SS["approvals"][(rid,cid)] = False
                     st.toast("Rejected")
 
-            # Render charts per module
+            # Render charts / tables / provenance per module
             module = c["module"]
             if module == "Cohort Retention (CSV)" or "curve" in res:
                 colA, colB = st.columns(2)
