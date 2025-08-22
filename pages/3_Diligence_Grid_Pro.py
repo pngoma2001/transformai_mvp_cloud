@@ -18,13 +18,20 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# Plotly for charts
+# Plotly for charts (primary renderer)
 try:
     import plotly.graph_objs as go
-    from plotly.subplots import make_subplots
+    from plotly.subplots import make_subplots  # noqa
     PLOTLY_OK = True
 except Exception:
     PLOTLY_OK = False
+
+# Altair for charts (fallback renderer so retention still shows)
+try:
+    import altair as alt
+    ALTAIR_OK = True
+except Exception:
+    ALTAIR_OK = False
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +42,7 @@ st.markdown(
     """
 <style>
 /* widen canvas and keep generous breathing room */
-.block-container {max-width: 1700px !important; padding-top: 0.75rem;}
+.block-container {max-width: 1700px !important; padding-top: 0.5rem;}
 /* **Fix H1 being visually cut** on some screens */
 h1, .stMarkdown h1 {
   white-space: normal !important;
@@ -470,50 +477,103 @@ def export_results_pdf() -> bytes:
 # Plot helpers (review page)
 # ---------------------------------------------------------------------------
 def plot_retention(curve: List[float]):
-    if not PLOTLY_OK:
-        st.line_chart(curve)
+    curve = [float(x) for x in (curve or [])]
+    if not curve:
+        st.info("No retention curve available.")
         return
-    x = list(range(len(curve)))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=curve, mode="lines+markers", name="retention"))
-    fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10), yaxis_tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
+    if PLOTLY_OK:
+        x = list(range(len(curve)))
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=curve, mode="lines+markers", name="retention"))
+        fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10), yaxis_tickformat=".0%")
+        st.plotly_chart(fig, use_container_width=True)
+    elif ALTAIR_OK:
+        df = pd.DataFrame({"month": list(range(len(curve))), "retention": curve})
+        ch = (
+            alt.Chart(df)
+            .mark_line(point=True)
+            .encode(x="month:O", y=alt.Y("retention:Q", axis=alt.Axis(format="%")))
+            .properties(height=320)
+        )
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.line_chart(curve)
 
 def plot_retention_heatmap(curve: List[float]):
-    if not PLOTLY_OK:
-        st.write(pd.DataFrame([curve]*5))
+    curve = [float(x) for x in (curve or [])]
+    if not curve:
+        st.info("No cohort heatmap available.")
         return
     # simple synthetic heatmap from the curve
     z = np.tile(curve, (5,1))
-    fig = go.Figure(data=go.Heatmap(z=z, colorscale="Blues"))
-    fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    if PLOTLY_OK:
+        fig = go.Figure(data=go.Heatmap(z=z, colorscale="Blues"))
+        fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    elif ALTAIR_OK:
+        df = pd.DataFrame(z)
+        df = df.reset_index().melt("index", var_name="month", value_name="value")
+        df = df.rename(columns={"index": "cohort"})
+        ch = (
+            alt.Chart(df)
+            .mark_rect()
+            .encode(x="month:O", y="cohort:O", color="value:Q")
+            .properties(height=320)
+        )
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.write(pd.DataFrame(z))
 
 def plot_nrr(series: List[Dict[str, Any]]):
-    if not PLOTLY_OK:
-        st.line_chart(pd.DataFrame(series).set_index("month")[["nrr","grr"]])
+    if not series:
+        st.info("No NRR/GRR series available.")
         return
-    months = [s["month"] for s in series]
-    nrr = [s["nrr"] for s in series]
-    grr = [s["grr"] for s in series]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=months, y=nrr, mode="lines+markers", name="NRR"))
-    fig.add_trace(go.Scatter(x=months, y=grr, mode="lines+markers", name="GRR"))
-    fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10), yaxis_tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
+    if PLOTLY_OK:
+        months = [s["month"] for s in series]
+        nrr = [s["nrr"] for s in series]
+        grr = [s["grr"] for s in series]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=months, y=nrr, mode="lines+markers", name="NRR"))
+        fig.add_trace(go.Scatter(x=months, y=grr, mode="lines+markers", name="GRR"))
+        fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10), yaxis_tickformat=".0%")
+        st.plotly_chart(fig, use_container_width=True)
+    elif ALTAIR_OK:
+        df = pd.DataFrame(series)
+        d1 = df.melt("month", value_vars=["nrr","grr"], var_name="metric", value_name="value")
+        ch = (
+            alt.Chart(d1)
+            .mark_line(point=True)
+            .encode(x="month:O", y=alt.Y("value:Q", axis=alt.Axis(format="%")), color="metric:N")
+            .properties(height=320)
+        )
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.line_chart(pd.DataFrame(series).set_index("month")[["nrr","grr"]])
 
 def plot_pricing(scatter: Dict[str, Any]):
-    if not PLOTLY_OK:
-        df = pd.DataFrame({"log_p": scatter.get("x",[]), "log_q": scatter.get("y",[])})
-        st.scatter_chart(df, x="log_p", y="log_q")
+    x = scatter.get("x", [])
+    y = scatter.get("y", [])
+    fit = scatter.get("fit", [])
+    if not x or not y:
+        st.info("No pricing scatter available.")
         return
-    x = scatter.get("x", []); y = scatter.get("y", []); fit = scatter.get("fit", [])
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="log Q vs log P"))
-    if fit:
-        fig.add_trace(go.Scatter(x=x, y=fit, mode="lines", name="fit"))
-    fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    if PLOTLY_OK:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="log Q vs log P"))
+        if fit:
+            fig.add_trace(go.Scatter(x=x, y=fit, mode="lines", name="fit"))
+        fig.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    elif ALTAIR_OK:
+        df = pd.DataFrame({"log_p": x, "log_q": y})
+        ch = alt.Chart(df).mark_point().encode(x="log_p:Q", y="log_q:Q").properties(height=320)
+        if fit:
+            df2 = pd.DataFrame({"log_p": x, "fit": fit})
+            ch = ch + alt.Chart(df2).mark_line().encode(x="log_p:Q", y="fit:Q")
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        df = pd.DataFrame({"log_p": x, "log_q": y})
+        st.scatter_chart(df, x="log_p", y="log_q")
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +706,7 @@ with tab_grid:
     st.divider()
     st.markdown("### Matrix Board — map **rows ↔ modules** (what should run where)")
 
-    if SS["rows"]:
+    if SS["rows"]]:
         base = []
         for r in SS["rows"]:
             sel = SS["matrix"].setdefault(r["id"], set())
@@ -745,14 +805,8 @@ with tab_run:
 # --------------------------- SHEET (Agentic Spreadsheet) ---------------------
 with tab_sheet:
     st.subheader("Agentic Spreadsheet (status by cell)")
-    rows_by_id = {r["id"]: r for r in SS["rows"]}
-    cols_by_id = {c["id"]: c for c in SS["columns"]}
-
-    # Build a simple sheet: rows x selected QoE columns
-    qoe_cols = [c for c in SS["columns"] if c["module"] in {m for _,m in QOE_TEMPLATE}]
-    # Fall back to all columns if none are QoE-template columns
-    if not qoe_cols:
-        qoe_cols = SS["columns"]
+    # pick QoE columns first; fall back to all columns if none
+    qoe_cols = [c for c in SS["columns"] if c["module"] in {m for _,m in QOE_TEMPLATE}] or SS["columns"]
 
     header = ["Row"] + [c["label"] for c in qoe_cols]
     table = []
@@ -814,7 +868,7 @@ with tab_review:
             module = c["module"]
 
             # Render only the charts relevant to this cell/module
-            if module == "Cohort Retention (CSV)":
+            if module == "Cohort Retention (CSV)" or "curve" in res:
                 colA, colB = st.columns(2)
                 with colA:
                     st.markdown("**Retention curve**")
