@@ -697,7 +697,11 @@ with tab_grid:
         new_label = st.text_input("New column label", value=SS.get("new_col_label","NRR/GRR"))
         SS["new_col_label"] = new_label
     with nc2:
-        new_mod = st.selectbox("Module", MODULES, index=MODULES.index(SS.get("new_col_mod","NRR/GRR (CSV)")) if SS.get("new_col_mod","NRR/GRR (CSV)") in MODULES else 3)
+        new_mod = st.selectbox(
+            "Module",
+            MODULES,
+            index=MODULES.index(SS.get("new_col_mod","NRR/GRR (CSV)")) if SS.get("new_col_mod","NRR/GRR (CSV)") in MODULES else 3
+        )
         SS["new_col_mod"] = new_mod
     with nc3:
         if st.button("Add Column", use_container_width=True):
@@ -706,7 +710,7 @@ with tab_grid:
     st.divider()
     st.markdown("### Matrix Board — map **rows ↔ modules** (what should run where)")
 
-    if SS["rows"]]:
+    if SS["rows"]:
         base = []
         for r in SS["rows"]:
             sel = SS["matrix"].setdefault(r["id"], set())
@@ -909,3 +913,4 @@ with tab_memo:
         st.write("Use **Run → Export memo PDF (demo)** to preview.")
     else:
         st.info("Install `reportlab` to enable PDF export.")
+
