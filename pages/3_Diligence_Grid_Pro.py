@@ -1,5 +1,5 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro) — Sprint C upgrade
+# TransformAI — Diligence Grid (Pro) — Sprint C upgrade (fixed)
 # - Starter Columns (matching rows only)
 # - Filters (status / row type / column) + bulk approve/review
 # - Export results CSV
@@ -825,7 +825,7 @@ if SS["grid"]["cells"]:
         if isinstance(eps,(int,float)):
             pct = st.slider("Proposed average price change (%)", min_value=-30, max_value=30, value=5, step=1)
             dp = pct/100.0; rev_change = (1+dp)**(1+eps) - 1
-            st.write(f"Estimated revenue change: **{_fmt_pct(rev_change)}** given ε≈{eps:.2f}")
+            st.write(f"Estimated revenue change: **{_fmt_pct(rev_change)}**** given ε≈{eps:.2f}")
         else:
             st.info("Run Pricing Power to compute elasticity first.")
 
@@ -1009,7 +1009,7 @@ def search_pdfs(q: str, topk: int = 3):
                 s = _score(ptxt, q)
                 if s > 0:
                     idx = ptxt.lower().find(q.lower()); idx = max(idx, 0)
-                    snippet = (ptxt[max(0, idx-160): idx+160] or "").replace("\n", " ")
+                    snippet = (ptxt[max(0, idx-160): idx+160] or "").replace("\n"," ")
                     results.append({"kind":"pdf","source":name,"page":i+1,"score":s,"snippet":snippet.strip()})
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:topk]
@@ -1053,21 +1053,31 @@ def answers_from_grid(q: str):
     return hits[:3]
 
 for role, content in SS["chat_history"]:
-    with st.chat_message(role): st.markdown(content)
+    with st.chat_message(role):
+        st.markdown(content)
 
 prompt = st.chat_input("Ask about your evidence (e.g., 'show EBITDA', 'pages about churn', 'which CSV has price?' )")
 if prompt:
-    SS["chat_history"].append(("user", prompt)); with st.chat_message("user"): st.markdown(prompt)
-    pdf_hits = search_pdfs(prompt, topk=3); csv_hits = search_csvs(prompt, topk=3); grid_hits = answers_from_grid(prompt)
+    # FIX: put `with st.chat_message` on its own line (no semicolon before with)
+    SS["chat_history"].append(("user", prompt))
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    pdf_hits = search_pdfs(prompt, topk=3)
+    csv_hits = search_csvs(prompt, topk=3)
+    grid_hits = answers_from_grid(prompt)
+
     parts = []
     if grid_hits:
         parts.append("**Existing answers (from grid):**")
         for h in grid_hits:
             parts.append(f"- _{h['row_ref']}_ • **{h['col_name']}** → {h['output_text']}")
-            if h["citations"]: parts.append(f"  · Citations: {len(h['citations'])}")
+            if h["citations"]:
+                parts.append(f"  · Citations: {len(h['citations'])}")
     if pdf_hits:
         parts.append("**PDF matches:**")
-        for h in pdf_hits: parts.append(f"- `{h['source']}` — p.{h['page']} · “{h['snippet']}”")
+        for h in pdf_hits:
+            parts.append(f"- `{h['source']}` — p.{h['page']} · “{h['snippet']}”")
     if csv_hits:
         parts.append("**CSV matches:**")
         for h in csv_hits:
