@@ -1,7 +1,12 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro) — Sprint A polish
-# Upload CSV/PDF → map schema → build grid → run modules → approve → memo with cross-checks → evidence chat
-# No external backend required.
+# TransformAI — Diligence Grid (Pro) — Sprint B upgrades
+# New in this version:
+# - Cohort heatmap alongside retention curve
+# - NRR/GRR waterfall (expansion / contraction / churn) for latest month pair
+# - Pricing segmentation: segment-level elasticities + revenue uplift simulator
+# - Evidence Chat filter (All / PDFs / CSVs)
+#
+# Run: streamlit run app.py  → open “Diligence Grid (Pro)”
 
 from __future__ import annotations
 import io, uuid, re, textwrap, json
@@ -51,7 +56,6 @@ def _new_id(p): return f"{p}_{uuid.uuid4().hex[:8]}"
 
 def _fmt_money(x: Optional[float]) -> str:
     if x is None or not isinstance(x, (int,float)) or x != x: return "-"
-    # Compact billions/millions when large
     if abs(x) >= 1_000_000_000: return f"${x/1_000_000_000:,.2f}B"
     if abs(x) >= 1_000_000:     return f"${x/1_000_000:,.2f}M"
     return f"${x:,.2f}"
@@ -67,7 +71,8 @@ def _find(df: pd.DataFrame, key: str) -> Optional[str]:
         "date":     ["date","timestamp","order_date","created_at","period","month"],
         "revenue":  ["revenue","amount","net_revenue","sales","gmv","value"],
         "price":    ["price","unit_price","avg_price","p"],
-        "quantity": ["qty","quantity","units","volume","q"]
+        "quantity": ["qty","quantity","units","volume","q"],
+        "segment":  ["segment","sku","product","category","plan","region","cohort","family"]
     }.get(key.lower(), [key.lower()])
     cols = list(df.columns)
     lower = {c.lower(): c for c in cols}
@@ -108,7 +113,8 @@ def _ensure_cells():
                     "status": "queued", "output_text": None,
                     "numeric_value": None, "units": None,
                     "kpis": {}, "citations": [],
-                    "confidence": None, "notes": [], "figure": None
+                    "confidence": None, "notes": [],
+                    "figure": None, "figure2": None  # NEW: second figure slot
                 })
 
 def delete_row(row_id: str):
@@ -137,8 +143,9 @@ class ModuleResult:
     citations: List[Dict[str, Any]]
     figure: Optional[Any] = None
     units_hint: Optional[str] = None  # "pct" or "money" or None
+    figure2: Optional[Any] = None     # NEW: extra visualization
 
-# Cohort Retention (CSV)
+# Cohort Retention (CSV) — now with heatmap
 def module_cohort_retention(df: pd.DataFrame,
                             customer_col: Optional[str]=None,
                             ts_col: Optional[str]=None,
@@ -155,29 +162,63 @@ def module_cohort_retention(df: pd.DataFrame,
     d = d.dropna(subset=[ts_col, customer_col]).sort_values(ts_col)
     d["first_month"] = d.groupby(customer_col)[ts_col].transform("min").dt.to_period("M")
     d["age"] = (d[ts_col].dt.to_period("M") - d["first_month"]).apply(lambda p: p.n)
+
     cohort_sizes = d.drop_duplicates([customer_col, "first_month"]).groupby("first_month")[customer_col].count()
     active = d.groupby(["first_month", "age"])[customer_col].nunique()
     mat = (active / cohort_sizes).unstack(fill_value=0).sort_index()
+
+    # Curve
     curve = mat.mean(axis=0) if not mat.empty else pd.Series(dtype=float)
     m3 = float(round(curve.get(3, np.nan), 4)) if not curve.empty else np.nan
     ltv_12 = None
     if revenue_col and revenue_col in d.columns:
         rev = d.groupby([customer_col, d[ts_col].dt.to_period("M")])[revenue_col].sum().groupby(customer_col).sum()
         ltv_12 = float(round(float(rev.mean()), 2))
-    fig = px.line(x=list(curve.index), y=list(curve.values),
-                  labels={"x":"Months since first purchase","y":"Retention"},
-                  title="Average Retention Curve")
+    fig_curve = px.line(x=list(curve.index), y=list(curve.values),
+                        labels={"x":"Months since first purchase","y":"Retention"},
+                        title="Average Retention Curve")
+
+    # Heatmap
+    if not mat.empty:
+        # Convert PeriodIndex to strings for axes
+        hm = mat.copy()
+        hm.index = hm.index.astype(str)
+        hm.columns = [int(c) for c in hm.columns]
+        fig_heat = px.imshow(hm.values,
+                             x=list(hm.columns),
+                             y=list(hm.index),
+                             aspect="auto",
+                             origin="upper",
+                             labels=dict(x="Months since first purchase", y="Cohort (first month)", color="Retention"),
+                             title="Cohort Heatmap (retention by cohort & age)")
+    else:
+        fig_heat = None
+
     narrative = f"Retention stabilizes ~M3 at {m3:.0%}." if m3==m3 else "Not enough data to compute M3 retention."
     if ltv_12: narrative += f" Avg 12-month LTV proxy ≈ {_fmt_money(ltv_12)}."
     return ModuleResult(
         kpis={"month_3_retention": m3, "ltv_12m": ltv_12},
         narrative=narrative,
         citations=[{"type":"table","ref":"(uploaded CSV)","selector":"all_rows"}],
-        figure=fig,
-        units_hint="pct"
+        figure=fig_curve,
+        units_hint="pct",
+        figure2=fig_heat
     )
 
-# Pricing Power (CSV)
+# Pricing Power (CSV) — now with segmentation & bar chart
+def _guess_segment_col(df: pd.DataFrame) -> Optional[str]:
+    cand = _find(df, "segment")
+    return cand
+
+def _ols_loglog(x: np.ndarray, y: np.ndarray) -> Tuple[float,float,Optional[float]]:
+    X = np.log(x); Y = np.log(y)
+    A = np.vstack([X, np.ones(len(X))]).T
+    beta, intercept = np.linalg.lstsq(A, Y, rcond=None)[0]
+    yhat = beta*X + intercept
+    ss_res = float(np.sum((Y - yhat)**2)); ss_tot = float(np.sum((Y - np.mean(Y))**2))
+    r2 = 1 - ss_res/ss_tot if ss_tot>0 else None
+    return float(beta), float(intercept), r2
+
 def module_pricing_power(df: pd.DataFrame,
                          price_col: Optional[str]=None,
                          qty_col: Optional[str]=None) -> ModuleResult:
@@ -187,36 +228,56 @@ def module_pricing_power(df: pd.DataFrame,
     qty_col   = qty_col   or _find(df, "quantity")
     if not (price_col and qty_col):
         return ModuleResult({}, "Missing price/quantity columns; map schema first.", [])
-    d = df[[price_col, qty_col]].dropna()
+
+    d = df[[price_col, qty_col] + [c for c in df.columns if c not in [price_col, qty_col]]].dropna(subset=[price_col, qty_col]).copy()
     d = d[(d[price_col] > 0) & (d[qty_col] > 0)]
     if len(d) < 8:
         return ModuleResult({}, "Need ≥ 8 observations for elasticity regression.", [])
-    X = np.log(d[price_col].values)
-    Y = np.log(d[qty_col].values)
-    A = np.vstack([X, np.ones(len(X))]).T
-    beta, intercept = np.linalg.lstsq(A, Y, rcond=None)[0]   # Y ≈ beta*X + intercept
-    fig = px.scatter(d, x=price_col, y=qty_col, title="Price vs Quantity")
+
+    # Global elasticity
+    beta, intercept, r2 = _ols_loglog(d[price_col].values, d[qty_col].values)
+    fig_scatter = px.scatter(d, x=price_col, y=qty_col, title="Price vs Quantity")
     xs = np.linspace(float(d[price_col].min()), float(d[price_col].max()), 60)
     ys = np.exp(beta*np.log(xs) + intercept)
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="fit"))
-    yhat = beta*X + intercept
-    ss_res = float(np.sum((Y - yhat)**2))
-    ss_tot = float(np.sum((Y - np.mean(Y))**2))
-    r2 = 1 - ss_res/ss_tot if ss_tot>0 else np.nan
+    fig_scatter.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="fit"))
     narrative = f"Own-price elasticity ≈ {beta:.2f} (R²={r2:.2f}). "
     narrative += "Inelastic (|ε|<1)." if abs(beta) < 1 else "Elastic (|ε|≥1)."
+
+    # Segment elasticities (auto-guess)
+    seg_col = _guess_segment_col(d)
+    seg_results = []
+    fig_segments = None
+    if seg_col and seg_col in d.columns:
+        topk = d[seg_col].value_counts().index.tolist()[:8]
+        bars_x, bars_y = [], []
+        for seg in topk:
+            sd = d[d[seg_col]==seg]
+            if len(sd) >= 6:
+                b, _int, _r2 = _ols_loglog(sd[price_col].values, sd[qty_col].values)
+                seg_results.append({"segment": str(seg), "elasticity": float(b), "r2": _r2})
+                bars_x.append(str(seg)); bars_y.append(float(b))
+        if seg_results:
+            fig_segments = go.Figure()
+            fig_segments.add_trace(go.Bar(x=bars_x, y=bars_y, name="Elasticity by segment"))
+            fig_segments.update_layout(title=f"Segment Elasticities (by {seg_col})",
+                                       xaxis_title=seg_col, yaxis_title="Elasticity (log-log slope)")
+
+    kpis = {"elasticity": float(beta), "r2": r2}
+    if seg_results: kpis["segments"] = seg_results
+
     return ModuleResult(
-        kpis={"elasticity": float(beta), "r2": r2},
+        kpis=kpis,
         narrative=narrative,
-        citations=[{"type":"table","ref":"(uploaded CSV)","selector":"price/qty columns"}]
+        citations=[{"type":"table","ref":"(uploaded CSV)","selector":"price/qty (+ segment if available)"}],
+        figure=fig_scatter,
+        figure2=fig_segments
     )
 
-# NRR/GRR (CSV)
+# NRR/GRR (CSV) — now with waterfall for latest month pair
 def module_nrr_grr(df: pd.DataFrame,
                    customer_col: Optional[str]=None,
                    ts_col: Optional[str]=None,
                    revenue_col: Optional[str]=None) -> ModuleResult:
-    """Computes monthly GRR/NRR + churn components (base = prior-month paying customers)."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return ModuleResult({}, "Empty dataset.", [], units_hint="pct")
     customer_col = customer_col or _find(df, "customer")
@@ -234,6 +295,7 @@ def module_nrr_grr(df: pd.DataFrame,
     if len(months) < 2: return ModuleResult({}, "Need at least two months of data.", [], units_hint="pct")
     labels, grr_list, nrr_list = [], [], []
     churn_rate, contraction_rate, expansion_rate = [], [], []
+    last_pair = None
     for i in range(1, len(months)):
         prev_m, curr_m = months[i-1], months[i]
         prev_rev, curr_rev = pivot[prev_m], pivot[curr_m]
@@ -252,14 +314,39 @@ def module_nrr_grr(df: pd.DataFrame,
         churn_rate.append(churn_amt / start)
         contraction_rate.append(contraction_amt / start)
         expansion_rate.append(expansion_amt / start)
+        last_pair = (str(prev_m), str(curr_m), start, churn_amt, contraction_amt, expansion_amt)
+
     if not labels: return ModuleResult({}, "Insufficient overlap to compute NRR/GRR.", [], units_hint="pct")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=labels, y=nrr_list, mode="lines+markers", name="NRR"))
-    fig.add_trace(go.Scatter(x=labels, y=grr_list, mode="lines+markers", name="GRR"))
+
+    # Lines
+    fig_lines = go.Figure()
+    fig_lines.add_trace(go.Scatter(x=labels, y=nrr_list, mode="lines+markers", name="NRR"))
+    fig_lines.add_trace(go.Scatter(x=labels, y=grr_list, mode="lines+markers", name="GRR"))
     ymax = float(np.nanmax(nrr_list + grr_list)) if len(nrr_list + grr_list) else 1.0
-    fig.update_layout(title="Monthly NRR & GRR (Base = prior-month payers)",
-                      xaxis_title="Month", yaxis_title="Rate",
-                      yaxis=dict(range=[0, max(1.2, ymax)]))
+    fig_lines.update_layout(title="Monthly NRR & GRR (Base = prior-month payers)",
+                            xaxis_title="Month", yaxis_title="Rate",
+                            yaxis=dict(range=[0, max(1.2, ymax)]))
+
+    # Waterfall for latest month pair
+    fig_wf = None
+    if last_pair:
+        pm, cm, start, churn_amt, contr_amt, exp_amt = last_pair
+        data = [
+            dict(name="Start", measure="absolute", y=start),
+            dict(name="Churn", measure="relative", y=-churn_amt),
+            dict(name="Contraction", measure="relative", y=-contr_amt),
+            dict(name="Expansion", measure="relative", y=exp_amt),
+            dict(name="End", measure="total", y=start - churn_amt - contr_amt + exp_amt),
+        ]
+        fig_wf = go.Figure(go.Waterfall(
+            name=f"{pm}→{cm}",
+            orientation="v",
+            measure=[d["measure"] for d in data],
+            x=[d["name"] for d in data],
+            y=[d["y"] for d in data]
+        ))
+        fig_wf.update_layout(title=f"Revenue Waterfall ({pm} → {cm})")
+
     last_label = labels[-1]
     kpis = {
         "month": last_label,
@@ -273,7 +360,7 @@ def module_nrr_grr(df: pd.DataFrame,
                  f"(expansion {kpis['expansion_rate']:.0%}, contraction {kpis['contraction_rate']:.0%}, churn {kpis['churn_rate']:.0%}).")
     return ModuleResult(kpis=kpis, narrative=narrative,
                         citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue by customer"}],
-                        figure=fig, units_hint="pct")
+                        figure=fig_lines, units_hint="pct", figure2=fig_wf)
 
 # PDF KPI extraction (regex)
 _money = re.compile(r"\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:billion|bn|million|m)?", re.I)
@@ -500,7 +587,6 @@ def _run_cell(cell: Dict[str,Any]):
     col = next(x for x in SS["grid"]["columns"] if x["id"]==cell["col_id"])
     cell["status"] = "running"
 
-    # Guardrails: CSV-only tools on table rows; PDF-only tool on PDF rows
     if row["type"] == "table":
         df = SS["tables"].get(row["source"])
         mapping = SS["schema_map"].get(row["source"], {})
@@ -526,10 +612,9 @@ def _run_cell(cell: Dict[str,Any]):
     # Persist result onto cell
     cell["status"] = "done" if res.kpis else "needs_review"
     cell["output_text"] = res.narrative
-    # pick a primary value for table view
+    # choose first numeric for quick glance
     v = None
     if res.kpis:
-        # choose first numeric in dict for quick glance
         for _k,_v in res.kpis.items():
             if isinstance(_v,(int,float)) and _v==_v:
                 v = float(_v); break
@@ -538,6 +623,7 @@ def _run_cell(cell: Dict[str,Any]):
     cell["kpis"] = res.kpis
     cell["citations"] = res.citations
     cell["figure"] = res.figure
+    cell["figure2"] = res.figure2
     _log("CELL_RUN", f"{row['row_ref']} × {col['name']} → {cell['status']}")
 
 with r1:
@@ -568,7 +654,6 @@ if SS["grid"]["cells"]:
     df = pd.DataFrame(grid["cells"]).copy()
     df["Row"] = df["row_id"].map(row_map)
     df["Column"] = df["col_id"].map(col_map)
-    # Friendly value string
     def _val(row):
         v = row.get("numeric_value")
         u = row.get("units")
@@ -590,13 +675,48 @@ if sel_cell_id:
     col  = next(x for x in SS["grid"]["columns"] if x["id"]==cell["col_id"])
     row  = next(x for x in SS["grid"]["rows"] if x["id"]==cell["row_id"])
     st.markdown(f"**{col['name']}** on _{row.get('alias') or row['row_ref']}_ — status: `{cell['status']}`")
-    if cell.get("figure") is not None:
-        st.plotly_chart(cell["figure"], use_container_width=True)
-    if cell.get("output_text"): st.write(cell["output_text"])
-    with st.expander("KPIs"):
-        st.json(cell.get("kpis", {}))
-    with st.expander("Citations"):
-        st.json(cell.get("citations", []))
+
+    # Show figures (now two slots)
+    tabs = st.tabs(["Chart 1", "Chart 2", "Details"])
+    with tabs[0]:
+        if cell.get("figure") is not None:
+            st.plotly_chart(cell["figure"], use_container_width=True)
+        else:
+            st.info("No chart available.")
+    with tabs[1]:
+        if cell.get("figure2") is not None:
+            st.plotly_chart(cell["figure2"], use_container_width=True)
+        else:
+            st.info("No second chart.")
+    with tabs[2]:
+        if cell.get("output_text"): st.write(cell["output_text"])
+        with st.expander("KPIs"):
+            st.json(cell.get("kpis", {}))
+        with st.expander("Citations"):
+            st.json(cell.get("citations", []))
+
+    # Pricing simulator if applicable
+    if next((True for cc in SS["grid"]["columns"] if cc["id"]==cell["col_id"] and cc["tool"]=="pricing_power"), False):
+        st.markdown("### 💡 Pricing Uplift Simulator")
+        eps = cell.get("kpis", {}).get("elasticity")
+        if isinstance(eps, (int,float)):
+            pct = st.slider("Proposed average price change (%)", min_value=-30, max_value=30, value=5, step=1)
+            # Simple constant elasticity revenue impact: ΔR/R ≈ (1+Δp)^(1+ε) - 1
+            dp = pct/100.0
+            rev_change = (1+dp)**(1+eps) - 1
+            st.write(f"Estimated revenue change: **{_fmt_pct(rev_change)}** given ε≈{eps:.2f}")
+            if "segments" in cell.get("kpis", {}):
+                st.caption("Segments estimated; assume similar response unless you re-estimate per segment.")
+        else:
+            st.info("Run Pricing Power to compute elasticity first.")
+
+    # NRR/GRR: explain rates
+    if next((True for cc in SS["grid"]["columns"] if cc["id"]==cell["col_id"] and cc["tool"]=="nrr_grr"), False):
+        k = cell.get("kpis", {})
+        if k:
+            st.markdown(f"**Latest month** · GRR {_fmt_pct(k.get('grr'))}, NRR {_fmt_pct(k.get('nrr'))} · "
+                        f"Expansion {_fmt_pct(k.get('expansion_rate'))}, Contraction {_fmt_pct(k.get('contraction_rate'))}, Churn {_fmt_pct(k.get('churn_rate'))}")
+
     a1,a2 = st.columns(2)
     with a1:
         if st.button("Approve"):
@@ -609,7 +729,6 @@ if sel_cell_id:
 st.subheader("6) Compose Memo & Export (with cross-checks)")
 
 def _csv_revenue_total() -> Optional[float]:
-    """Sum revenue across all uploaded CSVs that have a mapped revenue column."""
     total = 0.0; seen = False
     for name, df in SS["tables"].items():
         rev_col = SS["schema_map"].get(name, {}).get("revenue")
@@ -622,17 +741,14 @@ def _csv_revenue_total() -> Optional[float]:
     return total if seen else None
 
 def _nrr_last_churn() -> Optional[float]:
-    """Find last approved NRR/GRR cell and return churn_rate."""
     cells = [c for c in SS["grid"]["cells"] if c.get("status")=="approved"]
     nrr_cells = [c for c in cells if
                  next((col for col in SS["grid"]["columns"] if col["id"]==c["col_id"] and col["tool"]=="nrr_grr"), None)]
     if not nrr_cells: return None
-    # take the most recent approved
     k = nrr_cells[-1].get("kpis", {})
     return k.get("churn_rate")
 
 def _first_pdf_kpis() -> Dict[str, Any]:
-    """Return KPIs from the first approved PDF KPI cell (if any)."""
     for c in SS["grid"]["cells"]:
         if c.get("status")=="approved":
             col = next((x for x in SS["grid"]["columns"] if x["id"]==c["col_id"]), None)
@@ -642,11 +758,10 @@ def _first_pdf_kpis() -> Dict[str, Any]:
     return {}
 
 def _cross_checks() -> List[Tuple[str,str]]:
-    """Return list of (label, status_line) tuples for memo and screen."""
     checks = []
     pdf_kpis = _first_pdf_kpis()
 
-    # Revenue cross-check
+    # Revenue
     pdf_rev = pdf_kpis.get("revenue")
     csv_rev = _csv_revenue_total()
     if pdf_rev is not None and csv_rev is not None and csv_rev > 0:
@@ -660,7 +775,7 @@ def _cross_checks() -> List[Tuple[str,str]]:
     elif csv_rev is not None:
         checks.append(("Revenue", f"ℹ️ CSV {_fmt_money(csv_rev)} (no PDF revenue to compare)"))
 
-    # Churn cross-check
+    # Churn
     pdf_churn = pdf_kpis.get("churn")
     csv_churn = _nrr_last_churn()
     if (pdf_churn is not None) and (csv_churn is not None):
@@ -712,12 +827,13 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
     for ccell in approved:
         r = rows[ccell["row_id"]]; row_label = r.get("alias") or f"{r['type']}:{r['source']}"
         col_title = cols[ccell["col_id"]]["name"]
-        # Present a friendly key KPI if available
         val = ccell.get("numeric_value")
         units = ccell.get("units")
-        if units == "pct": val_str = f" — value: {_fmt_pct(val)}" if isinstance(val,(int,float)) else ""
-        else: val_str = f" — value: {val:,.2f}" if isinstance(val,(int,float)) else ""
-        line(f"• {col_title} on {row_label}{val_str}", 11)
+        if isinstance(val,(int,float)):
+            val_str = _fmt_pct(val) if units=="pct" else (f"{val:,.2f}")
+        else:
+            val_str = ""
+        line(f"• {col_title} on {row_label}" + (f" — value: {val_str}" if val_str else ""), 11)
         if ccell.get("output_text"):
             line(f"   {ccell['output_text']}", 10, leading=12)
         y -= 4
@@ -752,7 +868,6 @@ with left:
     if st.button("Compose (show markdown)"):
         approved = [c for c in SS["grid"]["cells"] if c.get("status") == "approved"]
         lines = [f"# Investment Memo — {SS['grid']['id']}", ""]
-        # Cross-checks (markdown view)
         checks = _cross_checks()
         if checks:
             lines.append("## Cross-checks (PDF vs CSV)")
@@ -762,12 +877,8 @@ with left:
         for ccell in approved:
             col = next(x for x in SS["grid"]["columns"] if x["id"]==ccell["col_id"])
             row = next(x for x in SS["grid"]["rows"] if x["id"]==ccell["row_id"])
-            val = ccell.get("numeric_value")
-            u = ccell.get("units")
-            if isinstance(val,(int,float)):
-                val_s = _fmt_pct(val) if u=="pct" else f"{val:,.2f}"
-            else:
-                val_s = ""
+            val = ccell.get("numeric_value"); u = ccell.get("units")
+            val_s = _fmt_pct(val) if (u=="pct" and isinstance(val,(int,float))) else (f"{val:,.2f}" if isinstance(val,(int,float)) else "")
             lines.append(f"- **{col['name']}** on _{row.get('alias') or row['row_ref']}_ → {val_s} — {ccell.get('output_text','')}")
         SS["last_memo_md"] = "\n".join(lines) or "# (no approved findings)"
         st.code(SS["last_memo_md"], language="markdown")
@@ -779,8 +890,9 @@ with right:
                        file_name=f"TransformAI_Memo_{SS['grid']['id']}.pdf",
                        mime="application/pdf")
 
-# --------------------- 7) EVIDENCE CHAT (BETA) ---------------------
+# --------------------- 7) EVIDENCE CHAT (BETA, filtered) ---------------------
 st.subheader("7) Evidence Chat (beta)")
+scope = st.radio("Search scope", options=["All","PDFs","CSVs"], horizontal=True)
 
 def _score(text: str, q: str) -> int:
     if not text: return 0
@@ -792,39 +904,41 @@ def _score(text: str, q: str) -> int:
 
 def search_pdfs(q: str, topk: int = 3):
     results = []
-    for name, pages in SS.get("docs", {}).items():
-        for i, ptxt in enumerate(pages):
-            s = _score(ptxt, q)
-            if s > 0:
-                idx = ptxt.lower().find(q.lower())
-                if idx < 0: idx = 0
-                snippet = (ptxt[max(0, idx-120): idx+120] or "").replace("\n", " ")
-                results.append({"kind":"pdf","source":name,"page":i+1,"score":s,"snippet":snippet.strip()})
+    if scope in ("All","PDFs"):
+        for name, pages in SS.get("docs", {}).items():
+            for i, ptxt in enumerate(pages):
+                s = _score(ptxt, q)
+                if s > 0:
+                    idx = ptxt.lower().find(q.lower())
+                    if idx < 0: idx = 0
+                    snippet = (ptxt[max(0, idx-160): idx+160] or "").replace("\n", " ")
+                    results.append({"kind":"pdf","source":name,"page":i+1,"score":s,"snippet":snippet.strip()})
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:topk]
 
 def search_csvs(q: str, topk: int = 3, sample_rows: int = 5):
     results = []
-    for name, df in SS.get("tables", {}).items():
-        s_cols = sum(1 for c in df.columns if q.lower() in c.lower())
-        s_cells = 0
-        try:
-            sample = df.head(200)
-            for col in sample.columns:
-                s_cells += sample[col].astype(str).str.lower().str.contains(q.lower(), na=False).sum()
-        except Exception:
-            pass
-        score = s_cols*3 + s_cells
-        if score > 0:
-            prev = pd.DataFrame()
+    if scope in ("All","CSVs"):
+        for name, df in SS.get("tables", {}).items():
+            s_cols = sum(1 for c in df.columns if q.lower() in c.lower())
+            s_cells = 0
             try:
-                mask = pd.Series(False, index=df.index)
-                for col in df.columns:
-                    mask = mask | df[col].astype(str).str.lower().str.contains(q.lower(), na=False)
-                prev = df[mask].head(sample_rows)
+                sample = df.head(300)
+                for col in sample.columns:
+                    s_cells += sample[col].astype(str).str.lower().str.contains(q.lower(), na=False).sum()
             except Exception:
                 pass
-            results.append({"kind":"csv","source":name,"score":score,"preview":prev})
+            score = s_cols*3 + s_cells
+            if score > 0:
+                prev = pd.DataFrame()
+                try:
+                    mask = pd.Series(False, index=df.index)
+                    for col in df.columns:
+                        mask = mask | df[col].astype(str).str.lower().str.contains(q.lower(), na=False)
+                    prev = df[mask].head(sample_rows)
+                except Exception:
+                    pass
+                results.append({"kind":"csv","source":name,"score":score,"preview":prev})
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:topk]
 
@@ -846,7 +960,6 @@ def answers_from_grid(q: str):
             })
     return hits[:3]
 
-# render previous chat
 for role, content in SS["chat_history"]:
     with st.chat_message(role):
         st.markdown(content)
