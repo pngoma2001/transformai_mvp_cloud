@@ -1,16 +1,14 @@
 # pages/3_Diligence_Grid_Pro.py
 # TransformAI — Diligence Grid (Pro)
-# Sprint-B features:
-# - Cohort curve + heatmap
-# - NRR/GRR lines + latest-month waterfall
-# - Pricing segmentation + revenue simulator
-# - Evidence Chat (filter All/PDFs/CSVs)
-# - Memo export with cross-checks (PDF vs CSV)
-# - Manage rows/columns (delete, reorder)
-# - FIX: clear-selection uses a flag before widgets (no Streamlit crash)
+# - Type-guarded cells (CSV-only vs PDF-only modules)
+# - Prune incompatible cells
+# - Quick manage (add/delete inline under results)
+# - Clear-selection fix (no Streamlit crash)
+# - Cohort curve + heatmap, Pricing segments + sim, NRR/GRR + waterfall
+# - PDF KPI extract, Evidence Chat, Memo export with cross-checks
 
 from __future__ import annotations
-import io, uuid, re, textwrap, json
+import io, uuid, re, textwrap
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -102,21 +100,6 @@ def _add_column(name:str, tool:str, params:Optional[Dict[str,Any]]=None):
     SS["grid"]["columns"].append({"id": cid, "name": name, "tool": tool, "params": params or {}})
     _log("COLUMN_ADDED", f"{name} [{tool}]")
     return cid
-
-def _ensure_cells():
-    have = {(c["row_id"], c["col_id"]) for c in SS["grid"]["cells"]}
-    for r in SS["grid"]["rows"]:
-        for c in SS["grid"]["columns"]:
-            if (r["id"], c["id"]) not in have:
-                SS["grid"]["cells"].append({
-                    "id": _new_id("cell"),
-                    "row_id": r["id"], "col_id": c["id"],
-                    "status": "queued", "output_text": None,
-                    "numeric_value": None, "units": None,
-                    "kpis": {}, "citations": [],
-                    "confidence": None, "notes": [],
-                    "figure": None, "figure2": None
-                })
 
 def delete_row(row_id: str):
     SS["grid"]["rows"] = [r for r in SS["grid"]["rows"] if r["id"] != row_id]
@@ -417,11 +400,36 @@ def module_pdf_kpi(pages: List[str]) -> ModuleResult:
         if v: citations.append({"type":"pdf","page":v["page"],"excerpt":v["snippet"][:220]})
     return ModuleResult(kpis=kpis, narrative=narrative, citations=citations)
 
+# Type-aware registry
 MODULES = {
-    "cohort_retention": {"title":"Cohort Retention (CSV)", "fn": module_cohort_retention, "needs": ["customer","date"], "optional": ["revenue"]},
-    "pricing_power":   {"title":"Pricing Power (CSV)",   "fn": module_pricing_power,   "needs": ["price","quantity"], "optional": []},
-    "nrr_grr":         {"title":"NRR/GRR (CSV)",         "fn": module_nrr_grr,         "needs": ["customer","date","revenue"], "optional": []},
-    "pdf_kpi_extract": {"title":"PDF KPI Extract",       "fn": module_pdf_kpi,         "needs": [], "optional": []},
+    "cohort_retention": {
+        "title": "Cohort Retention (CSV)",
+        "fn": module_cohort_retention,
+        "needs": ["customer", "date"],
+        "optional": ["revenue"],
+        "applies_to": ["table"],   # CSV rows only
+    },
+    "pricing_power": {
+        "title": "Pricing Power (CSV)",
+        "fn": module_pricing_power,
+        "needs": ["price", "quantity"],
+        "optional": [],
+        "applies_to": ["table"],   # CSV rows only
+    },
+    "nrr_grr": {
+        "title": "NRR/GRR (CSV)",
+        "fn": module_nrr_grr,
+        "needs": ["customer", "date", "revenue"],
+        "optional": [],
+        "applies_to": ["table"],   # CSV rows only
+    },
+    "pdf_kpi_extract": {
+        "title": "PDF KPI Extract",
+        "fn": module_pdf_kpi,
+        "needs": [],
+        "optional": [],
+        "applies_to": ["pdf"],     # PDF rows only
+    },
 }
 
 # -------------------- 1) EVIDENCE SOURCES --------------------
@@ -499,6 +507,45 @@ with st.expander("2) Map CSV Schema", expanded=False):
             _log("SCHEMA_SAVED", name)
             st.success("Saved.")
 
+# -------------------- PRUNE + ENSURE CELLS --------------------
+def _prune_incompatible_cells():
+    """Remove any cells that pair a column's module with an incompatible row type."""
+    rows_by_id = {r["id"]: r for r in SS["grid"]["rows"]}
+    cols_by_id = {c["id"]: c for c in SS["grid"]["columns"]}
+    kept = []
+    for cell in SS["grid"]["cells"]:
+        r = rows_by_id.get(cell["row_id"])
+        c = cols_by_id.get(cell["col_id"])
+        if not r or not c:
+            continue
+        applies = MODULES.get(c["tool"], {}).get("applies_to", ["table", "pdf"])
+        if r["type"] in applies:
+            kept.append(cell)
+    if len(kept) != len(SS["grid"]["cells"]):
+        SS["grid"]["cells"] = kept
+        _log("CELLS_PRUNED", f"{len(kept)} kept")
+
+def _ensure_cells():
+    """Create missing cells only for compatible (row_type × module) pairs."""
+    _prune_incompatible_cells()
+    have = {(c["row_id"], c["col_id"]) for c in SS["grid"]["cells"]}
+    for r in SS["grid"]["rows"]:
+        rtype = r["type"]  # "table" or "pdf"
+        for c in SS["grid"]["columns"]:
+            applies = MODULES.get(c["tool"], {}).get("applies_to", ["table", "pdf"])
+            if rtype not in applies:
+                continue
+            if (r["id"], c["id"]) not in have:
+                SS["grid"]["cells"].append({
+                    "id": _new_id("cell"),
+                    "row_id": r["id"], "col_id": c["id"],
+                    "status": "queued", "output_text": None,
+                    "numeric_value": None, "units": None,
+                    "kpis": {}, "citations": [],
+                    "confidence": None, "notes": [],
+                    "figure": None, "figure2": None
+                })
+
 # -------------------- 3) BUILD GRID --------------------
 st.subheader("3) Build Grid")
 b1,b2,b3 = st.columns(3)
@@ -540,6 +587,7 @@ with st.expander("Manage rows & columns", expanded=False):
         with cols[2]:
             if st.button("🗑️ Delete", key=f"delrow_{r['id']}"):
                 delete_row(r["id"])
+                _ensure_cells()
                 try: st.rerun()
                 except: st.experimental_rerun()
 
@@ -551,19 +599,19 @@ with st.expander("Manage rows & columns", expanded=False):
             c["name"] = st.text_input(f"Column label ({c['tool']})", c["name"], key=f"colname_{c['id']}")
         with cols[1]:
             if st.button("⬆️ Up", key=f"up_{c['id']}"):
-                move_col(c["id"], "up")
+                move_col(c["id"], "up"); _ensure_cells()
                 try: st.rerun()
                 except: st.experimental_rerun()
         with cols[2]:
             if st.button("⬇️ Down", key=f"dn_{c['id']}"):
-                move_col(c["id"], "down")
+                move_col(c["id"], "down"); _ensure_cells()
                 try: st.rerun()
                 except: st.experimental_rerun()
         with cols[3]:
             st.caption(c["tool"])
         with cols[4]:
             if st.button("🗑️ Delete", key=f"delcol_{c['id']}"):
-                delete_col(c["id"])
+                delete_col(c["id"]); _ensure_cells()
                 try: st.rerun()
                 except: st.experimental_rerun()
 
@@ -680,6 +728,60 @@ if SS["grid"]["cells"]:
     df["Summary"] = df.get("output_text", "").astype(str).str.slice(0, 160)
     view_cols = ["Row", "Column", "status", "Value", "Summary"]
     st.dataframe(df[view_cols], hide_index=True, use_container_width=True)
+
+    # ---------- Quick manage inline ----------
+    with st.expander("Quick manage (add/delete without leaving this page)", expanded=False):
+        row_alias = lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid)
+        col_name  = lambda cid: next((c["name"] for c in SS["grid"]["columns"] if c["id"]==cid), cid)
+
+        # Add rows from sources not yet present
+        st.markdown("**Add rows**")
+        existing_table_sources = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="table"}
+        existing_pdf_sources   = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="pdf"}
+
+        add_tables = st.multiselect(
+            "From CSVs", options=[name for name in SS["tables"].keys() if name not in existing_table_sources]
+        )
+        add_pdfs = st.multiselect(
+            "From PDFs", options=[name for name in SS["docs"].keys() if name not in existing_pdf_sources]
+        )
+        if st.button("Add selected rows"):
+            for name in add_tables: _add_row_from_table(name)
+            for name in add_pdfs:   _add_row_from_pdf(name)
+            _ensure_cells()
+            try: st.rerun()
+            except: st.experimental_rerun()
+
+        st.markdown("---")
+
+        # Delete rows inline
+        st.markdown("**Delete rows**")
+        del_rows = st.multiselect(
+            "Pick rows to delete",
+            options=[r["id"] for r in SS["grid"]["rows"]],
+            format_func=row_alias,
+            key="inline_del_rows"
+        )
+        if st.button("Delete selected row(s)"):
+            for rid in del_rows: delete_row(rid)
+            _ensure_cells()
+            try: st.rerun()
+            except: st.experimental_rerun()
+
+        # Delete columns inline
+        st.markdown("**Delete columns**")
+        del_cols = st.multiselect(
+            "Pick columns to delete",
+            options=[c["id"] for c in SS["grid"]["columns"]],
+            format_func=col_name,
+            key="inline_del_cols"
+        )
+        if st.button("Delete selected column(s)"):
+            for cid in del_cols: delete_col(cid)
+            _ensure_cells()
+            try: st.rerun()
+            except: st.experimental_rerun()
+
 else:
     st.info("No cells yet. Add rows & a column, then run.")
 
