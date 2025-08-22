@@ -1,14 +1,16 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro) — Sprint C upgrade (fixed)
-# - Starter Columns (matching rows only)
-# - Filters (status / row type / column) + bulk approve/review
-# - Export results CSV
-# - Memo column picker (defaults to approved)
-# - Light cache + Force re-run
-# - Keeps type-guards, quick-manage, charts, memo cross-checks
+# TransformAI — Diligence Grid (Pro) — Next Phase Upgrade
+# - Saved Views (filters)
+# - Template Grids (CDD/QofE)
+# - Attention-only toggle (needs_review/error)
+# - Applicability warnings
+# - Inline Row/Column Manager with Undo/Redo
+# - Export/Import grid config (rows/columns/schema_map)
+# - Row manager with bulk delete + run-per-row
+# - Keeps Cohort, Pricing, NRR/GRR, PDF KPI modules and Memo export
 
 from __future__ import annotations
-import io, uuid, re, textwrap, hashlib
+import io, uuid, re, textwrap, hashlib, json, copy
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -28,7 +30,7 @@ except Exception:
 
 st.set_page_config(page_title="TransformAI — Diligence (Pro)", layout="wide")
 st.title("Transform AI — Diligence Grid (Pro)")
-st.caption("Upload CSV/PDF → map schema → run Cohorts, Pricing, NRR/GRR, PDF KPIs → approve → Export Investor Memo with cross-checks.")
+st.caption("CSV+PDF ingest → map schema → build grid → run analyses → approve → memo export with citations.")
 
 SS = st.session_state
 SS.setdefault("tables", {})
@@ -38,8 +40,13 @@ SS.setdefault("chat_history", [])
 SS.setdefault("sel_rows", [])
 SS.setdefault("sel_cols", [])
 SS.setdefault("do_clear_selection", False)
-SS.setdefault("cache", {})  # cell_id -> {"sig": ..., "result": ...}
-SS.setdefault("memo_cols", None)  # list of column ids selected for memo (None=auto)
+SS.setdefault("cache", {})                # cell_id -> {"sig": ..., "result": ModuleResult}
+SS.setdefault("memo_cols", None)          # list of column ids selected for memo (None=all)
+SS.setdefault("views", {})                # saved views (filters)
+SS.setdefault("attention_only", False)
+SS.setdefault("history", [])              # undo/redo snapshots
+SS.setdefault("history_idx", -1)
+
 SS.setdefault("grid", {
     "id": f"grid_{uuid.uuid4().hex[:6]}",
     "rows": [],
@@ -48,7 +55,7 @@ SS.setdefault("grid", {
     "activities": []
 })
 
-# -------------------- utils --------------------
+# ------------- utilities & history -------------
 def _log(action:str, detail:str=""):
     SS["grid"]["activities"].append({"id": uuid.uuid4().hex, "action": action, "detail": detail})
 
@@ -64,24 +71,38 @@ def _fmt_pct(x: Optional[float]) -> str:
     if x is None or not isinstance(x,(int,float)) or x!=x: return "-"
     return f"{x*100:.1f}%"
 
-def _find(df: pd.DataFrame, key: str) -> Optional[str]:
-    bank = {
-        "customer": ["customer","user","buyer","account","client","cust","cust_id","customer_id"],
-        "date":     ["date","timestamp","order_date","created_at","period","month"],
-        "revenue":  ["revenue","amount","net_revenue","sales","gmv","value"],
-        "price":    ["price","unit_price","avg_price","p"],
-        "quantity": ["qty","quantity","units","volume","q"],
-        "segment":  ["segment","sku","product","category","plan","region","cohort","family"]
-    }.get(key.lower(), [key.lower()])
-    cols = list(df.columns); lower = {c.lower(): c for c in cols}
-    for needle in bank:
-        if needle in lower: return lower[needle]
-    for needle in bank:
-        for c in cols:
-            if needle in c.lower(): return c
-    return None
+def _snapshot():
+    """Push a deep copy snapshot for undo/redo."""
+    snap = {
+        "grid": copy.deepcopy(SS["grid"]),
+        "schema_map": copy.deepcopy(SS["schema_map"]),
+        "cache": {}  # skip heavy cache; will recompute
+    }
+    # truncate any future redos
+    if SS["history_idx"] < len(SS["history"]) - 1:
+        SS["history"] = SS["history"][:SS["history_idx"]+1]
+    SS["history"].append(snap)
+    SS["history_idx"] += 1
 
-# -------------------- grid helpers --------------------
+def _undo():
+    if SS["history_idx"] <= 0: return False
+    SS["history_idx"] -= 1
+    snap = SS["history"][SS["history_idx"]]
+    SS["grid"] = copy.deepcopy(snap["grid"])
+    SS["schema_map"] = copy.deepcopy(snap["schema_map"])
+    SS["cache"].clear()
+    return True
+
+def _redo():
+    if SS["history_idx"] >= len(SS["history"]) - 1: return False
+    SS["history_idx"] += 1
+    snap = SS["history"][SS["history_idx"]]
+    SS["grid"] = copy.deepcopy(snap["grid"])
+    SS["schema_map"] = copy.deepcopy(snap["schema_map"])
+    SS["cache"].clear()
+    return True
+
+# ------------- grid helpers -------------
 def _add_row_from_table(name:str):
     rid = _new_id("row")
     SS["grid"]["rows"].append({"id": rid, "row_ref": f"table:{name}", "source": name, "type": "table", "alias": f"{name} (Transactions)"})
@@ -119,7 +140,7 @@ def move_col(col_id: str, direction: str):
     if direction=="down" and idx < len(cols)-1: cols[idx+1], cols[idx] = cols[idx], cols[idx+1]
     _log("COLUMN_MOVED", f"{col_id}:{direction}")
 
-# -------------------- modules --------------------
+# ------------- modules -------------
 @dataclass
 class ModuleResult:
     kpis: Dict[str, Any]
@@ -129,6 +150,24 @@ class ModuleResult:
     units_hint: Optional[str] = None
     figure2: Optional[Any] = None
 
+def _find(df: pd.DataFrame, key: str) -> Optional[str]:
+    bank = {
+        "customer": ["customer","user","buyer","account","client","cust","cust_id","customer_id"],
+        "date":     ["date","timestamp","order_date","created_at","period","month"],
+        "revenue":  ["revenue","amount","net_revenue","sales","gmv","value"],
+        "price":    ["price","unit_price","avg_price","p"],
+        "quantity": ["qty","quantity","units","volume","q"],
+        "segment":  ["segment","sku","product","category","plan","region","cohort","family"]
+    }.get(key.lower(), [key.lower()])
+    cols = list(df.columns); lower = {c.lower(): c for c in cols}
+    for needle in bank:
+        if needle in lower: return lower[needle]
+    for needle in bank:
+        for c in cols:
+            if needle in c.lower(): return c
+    return None
+
+# --- Cohort Retention ---
 def module_cohort_retention(df: pd.DataFrame,
                             customer_col: Optional[str]=None,
                             ts_col: Optional[str]=None,
@@ -187,6 +226,7 @@ def module_cohort_retention(df: pd.DataFrame,
         figure2=fig_heat
     )
 
+# --- Pricing Power (elasticity) ---
 def _ols_loglog(x: np.ndarray, y: np.ndarray) -> Tuple[float,float,Optional[float]]:
     X = np.log(x); Y = np.log(y)
     A = np.vstack([X, np.ones(len(X))]).T
@@ -251,6 +291,7 @@ def module_pricing_power(df: pd.DataFrame,
         figure2=fig_segments
     )
 
+# --- NRR / GRR ---
 def module_nrr_grr(df: pd.DataFrame,
                    customer_col: Optional[str]=None,
                    ts_col: Optional[str]=None,
@@ -336,6 +377,7 @@ def module_nrr_grr(df: pd.DataFrame,
                         citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue by customer"}],
                         figure=fig_lines, units_hint="pct", figure2=fig_wf)
 
+# --- PDF KPI Extract ---
 _money = re.compile(r"\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:billion|bn|million|m)?", re.I)
 _pct   = re.compile(r"\d{1,3}(?:\.\d+)?\s*%")
 
@@ -396,37 +438,13 @@ def module_pdf_kpi(pages: List[str]) -> ModuleResult:
     return ModuleResult(kpis=kpis, narrative=narrative, citations=citations)
 
 MODULES = {
-    "cohort_retention": {
-        "title": "Cohort Retention (CSV)",
-        "fn": module_cohort_retention,
-        "needs": ["customer", "date"],
-        "optional": ["revenue"],
-        "applies_to": ["table"],
-    },
-    "pricing_power": {
-        "title": "Pricing Power (CSV)",
-        "fn": module_pricing_power,
-        "needs": ["price", "quantity"],
-        "optional": [],
-        "applies_to": ["table"],
-    },
-    "nrr_grr": {
-        "title": "NRR/GRR (CSV)",
-        "fn": module_nrr_grr,
-        "needs": ["customer", "date", "revenue"],
-        "optional": [],
-        "applies_to": ["table"],
-    },
-    "pdf_kpi_extract": {
-        "title": "PDF KPI Extract",
-        "fn": module_pdf_kpi,
-        "needs": [],
-        "optional": [],
-        "applies_to": ["pdf"],
-    },
+    "cohort_retention": {"title": "Cohort Retention (CSV)", "fn": module_cohort_retention, "needs": ["customer", "date"], "optional": ["revenue"], "applies_to": ["table"]},
+    "pricing_power":    {"title": "Pricing Power (CSV)",    "fn": module_pricing_power,    "needs": ["price", "quantity"], "optional": [], "applies_to": ["table"]},
+    "nrr_grr":          {"title": "NRR/GRR (CSV)",          "fn": module_nrr_grr,          "needs": ["customer", "date", "revenue"], "optional": [], "applies_to": ["table"]},
+    "pdf_kpi_extract":  {"title": "PDF KPI Extract",        "fn": module_pdf_kpi,          "needs": [], "optional": [], "applies_to": ["pdf"]},
 }
 
-# -------------------- 1) Evidence Sources --------------------
+# ------------- 1) Evidence Sources -------------
 st.subheader("1) Evidence Sources")
 c_csv, c_pdf = st.columns(2)
 
@@ -440,6 +458,7 @@ with c_csv:
                 SS["schema_map"].setdefault(f.name, {"customer":None,"date":None,"revenue":None,"price":None,"quantity":None})
                 _log("SOURCE_ADDED", f"csv:{f.name}")
                 st.success(f"Loaded CSV: {f.name} ({df.shape[0]:,} rows)")
+                _snapshot()
             except Exception as e:
                 st.error(f"{f.name}: {e}")
 
@@ -457,8 +476,9 @@ with c_pdf:
             SS["docs"][f.name] = pages
             _log("SOURCE_ADDED", f"pdf:{f.name}")
             st.success(f"Loaded PDF: {f.name} ({len(pages)} pages)")
+            _snapshot()
 
-# -------------------- 2) Map CSV Schema --------------------
+# ------------- 2) Map CSV Schema -------------
 with st.expander("2) Map CSV Schema", expanded=False):
     def _auto_guess(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         return {"customer": _find(df,"customer"), "date": _find(df,"date"),
@@ -466,7 +486,7 @@ with st.expander("2) Map CSV Schema", expanded=False):
     if st.button("Auto-map all tables"):
         for name, df in SS["tables"].items():
             SS["schema_map"][name] = _auto_guess(df)
-        st.success("Guessed schemas.")
+        _log("SCHEMA_AUTOGUESS","all"); _snapshot(); st.success("Guessed schemas.")
 
     for name, df in SS["tables"].items():
         st.markdown(f"**{name}** — {df.shape[0]:,} rows × {df.shape[1]:,} cols")
@@ -491,23 +511,28 @@ with st.expander("2) Map CSV Schema", expanded=False):
                 "price":    None if price=="(none)" else price,
                 "quantity": None if qty=="(none)" else qty,
             }
-            _log("SCHEMA_SAVED", name); st.success("Saved.")
+            _log("SCHEMA_SAVED", name); _snapshot(); st.success("Saved.")
 
-# -------------------- prune + ensure cells --------------------
-def _prune_incompatible_cells():
+# ------------- compatibility + cells -------------
+def _prune_incompatible_cells() -> int:
     rows_by_id = {r["id"]: r for r in SS["grid"]["rows"]}
     cols_by_id = {c["id"]: c for c in SS["grid"]["columns"]}
     kept = []
+    dropped = 0
     for cell in SS["grid"]["cells"]:
         r = rows_by_id.get(cell["row_id"]); c = cols_by_id.get(cell["col_id"])
-        if not r or not c: continue
+        if not r or not c: 
+            dropped += 1
+            continue
         applies = MODULES.get(c["tool"], {}).get("applies_to", ["table","pdf"])
         if r["type"] in applies: kept.append(cell)
+        else: dropped += 1
     if len(kept) != len(SS["grid"]["cells"]):
-        SS["grid"]["cells"] = kept; _log("CELLS_PRUNED", f"{len(kept)} kept")
+        SS["grid"]["cells"] = kept
+    return dropped
 
 def _ensure_cells():
-    _prune_incompatible_cells()
+    dropped = _prune_incompatible_cells()
     have = {(c["row_id"], c["col_id"]) for c in SS["grid"]["cells"]}
     for r in SS["grid"]["rows"]:
         rtype = r["type"]
@@ -523,68 +548,124 @@ def _ensure_cells():
                     "confidence": None, "notes": [],
                     "figure": None, "figure2": None
                 })
+    return dropped
 
-# -------------------- 3) Build Grid --------------------
+# ------------- 3) Build Grid -------------
 st.subheader("3) Build Grid")
-b1,b2,b3,b4 = st.columns(4)
-with b1:
-    if st.button("Add rows from all CSVs"):
-        for name in SS["tables"].keys(): _add_row_from_table(name)
-        _ensure_cells()
-with b2:
-    if st.button("Add rows from all PDFs"):
-        for name in SS["docs"].keys(): _add_row_from_pdf(name)
-        _ensure_cells()
-with b3:
-    if st.button("Add Starter Columns (all 4)"):
-        for name, tool in [("Cohort Retention","cohort_retention"),
-                           ("Pricing Power","pricing_power"),
-                           ("NRR/GRR","nrr_grr"),
-                           ("PDF KPIs","pdf_kpi_extract")]:
-            _add_column(name, tool, {})
-        _ensure_cells(); st.success("Added 4 starter columns.")
-with b4:
-    if st.button("Add Starter Columns (matching rows)"):
-        has_csv = any(r["type"]=="table" for r in SS["grid"]["rows"])
-        has_pdf = any(r["type"]=="pdf" for r in SS["grid"]["rows"])
-        existing_tools = {c["tool"] for c in SS["grid"]["columns"]}
-        if has_csv:
-            for name,tool in [("Cohort Retention","cohort_retention"),
-                              ("Pricing Power","pricing_power"),
-                              ("NRR/GRR","nrr_grr")]:
-                if tool not in existing_tools: _add_column(name, tool, {})
-        if has_pdf and "pdf_kpi_extract" not in existing_tools:
-            _add_column("PDF KPIs","pdf_kpi_extract",{})
-        _ensure_cells(); st.success("Added matching starter columns.")
+top_l, top_r = st.columns([0.7, 0.3])
 
-col_name = st.text_input("Column label", value="PDF KPIs")
+with top_l:
+    b1,b2,b3,b4 = st.columns(4)
+    with b1:
+        if st.button("Add rows from all CSVs"):
+            for name in SS["tables"].keys(): _add_row_from_table(name)
+            dropped = _ensure_cells(); _snapshot()
+            st.success(f"Added CSV rows. Skipped {dropped} incompatible cells." if dropped else "Added CSV rows.")
+    with b2:
+        if st.button("Add rows from all PDFs"):
+            for name in SS["docs"].keys(): _add_row_from_pdf(name)
+            dropped = _ensure_cells(); _snapshot()
+            st.success(f"Added PDF rows. Skipped {dropped} incompatible cells." if dropped else "Added PDF rows.")
+    with b3:
+        if st.button("Add Starter Columns (all 4)"):
+            for name, tool in [("Cohort Retention","cohort_retention"),
+                               ("Pricing Power","pricing_power"),
+                               ("NRR/GRR","nrr_grr"),
+                               ("PDF KPIs","pdf_kpi_extract")]:
+                _add_column(name, tool, {})
+            dropped = _ensure_cells(); _snapshot()
+            if dropped: st.warning(f"Added, but {dropped} cell slots were inapplicable and skipped.")
+            else: st.success("Added 4 starter columns.")
+    with b4:
+        if st.button("Add Starter Columns (matching rows)"):
+            has_csv = any(r["type"]=="table" for r in SS["grid"]["rows"])
+            has_pdf = any(r["type"]=="pdf" for r in SS["grid"]["rows"])
+            existing_tools = {c["tool"] for c in SS["grid"]["columns"]}
+            added = 0
+            if has_csv:
+                for name,tool in [("Cohort Retention","cohort_retention"),
+                                  ("Pricing Power","pricing_power"),
+                                  ("NRR/GRR","nrr_grr")]:
+                    if tool not in existing_tools:
+                        _add_column(name, tool, {}); added += 1
+            if has_pdf and "pdf_kpi_extract" not in existing_tools:
+                _add_column("PDF KPIs","pdf_kpi_extract",{}); added += 1
+            dropped = _ensure_cells(); _snapshot()
+            st.success(f"Added {added} matching columns; skipped {dropped} inapplicable cells.")
+
+with top_r:
+    st.markdown("**Quick Template Grid**")
+    tmpl = st.selectbox("Template", options=["(choose)","CDD (Customer DD)","QofE (Quant of Earnings)"])
+    if st.button("Apply Template"):
+        if tmpl == "CDD (Customer DD)":
+            # CDD focus: cohorts, NRR/GRR, PDF KPIs
+            for t in ["cohort_retention","nrr_grr","pdf_kpi_extract"]:
+                if t not in {c["tool"] for c in SS["grid"]["columns"]}:
+                    _add_column({"cohort_retention":"Cohort Retention","nrr_grr":"NRR/GRR","pdf_kpi_extract":"PDF KPIs"}[t], t, {})
+        elif tmpl == "QofE (Quant of Earnings)":
+            # QofE wedge: pricing, PDF KPIs, NRR/GRR
+            for t in ["pricing_power","pdf_kpi_extract","nrr_grr"]:
+                if t not in {c["tool"] for c in SS["grid"]["columns"]}:
+                    _add_column({"pricing_power":"Pricing Power","pdf_kpi_extract":"PDF KPIs","nrr_grr":"NRR/GRR"}[t], t, {})
+        dropped = _ensure_cells(); _snapshot()
+        st.success(f"Template applied; skipped {dropped} inapplicable cells." if dropped else "Template applied.")
+
+# Add arbitrary column
+col_name = st.text_input("New column label", value="PDF KPIs")
 tool_key = st.selectbox("Module", options=list(MODULES.keys()), format_func=lambda k: MODULES[k]["title"])
-c_add1, _ = st.columns([0.25, 0.75])
-with c_add1:
-    if st.button("Add Column"):
-        _add_column(col_name, tool_key, params={}); _ensure_cells()
-        st.success(f"Added column: {col_name} [{tool_key}]")
+if st.button("Add Column"):
+    _add_column(col_name, tool_key, params={})
+    dropped = _ensure_cells(); _snapshot()
+    if dropped: st.warning(f"Added, but skipped {dropped} inapplicable cell slots.")
+    else: st.success(f"Added column: {col_name} [{tool_key}]")
 
-with st.expander("Manage rows & columns", expanded=False):
+# Manage rows/columns with Undo/Redo
+with st.expander("Manage rows & columns (with Undo/Redo)", expanded=False):
+    u1,u2,u3 = st.columns([0.15,0.15,0.70])
+    with u1:
+        if st.button("↩️ Undo"): 
+            if _undo(): st.experimental_rerun()
+            else: st.info("Nothing to undo.")
+    with u2:
+        if st.button("↪️ Redo"):
+            if _redo(): st.experimental_rerun()
+            else: st.info("Nothing to redo.")
+    with u3:
+        st.caption("Undo/Redo applies to grid structure and schema mapping.")
+
     st.markdown("**Rows**")
-    for r in list(SS["grid"]["rows"]):
-        cols = st.columns([0.58, 0.22, 0.10, 0.10])
-        with cols[0]:
-            r["alias"] = st.text_input(f"Alias for {r['row_ref']}", r.get("alias", r["row_ref"]), key=f"alias_{r['id']}")
-        with cols[1]:
-            st.caption(f"type: {r['type']}")
-        with cols[2]:
-            if st.button("⬆️ Up", key=f"r_up_{r['id']}"):
-                idx = next((i for i,x in enumerate(SS["grid"]["rows"]) if x["id"]==r["id"]), None)
-                if idx is not None and idx>0:
-                    SS["grid"]["rows"][idx-1], SS["grid"]["rows"][idx] = SS["grid"]["rows"][idx], SS["grid"]["rows"][idx-1]
-                    try: st.rerun()
-                    except: st.experimental_rerun()
-        with cols[3]:
-            if st.button("🗑️ Delete", key=f"delrow_{r['id']}"):
-                delete_row(r["id"]); _ensure_cells()
-                try: st.rerun()
-                except: st.experimental_rerun()
+    # Bulk row manager
+    if SS["grid"]["rows"]:
+        rm_df = pd.DataFrame([{"Row ID": r["id"], "Alias": r.get("alias") or r["row_ref"], "Type": r["type"], "Source": r["source"], "Delete?": False} for r in SS["grid"]["rows"]])
+        edited = st.data_editor(rm_df, num_rows="dynamic", use_container_width=True, key="row_mgr")
+        to_del = edited[edited["Delete?"] == True]["Row ID"].tolist() if "Delete?" in edited else []
+        rcols = st.columns([0.25,0.25,0.25,0.25])
+        with rcols[0]:
+            if st.button("Delete selected row(s)"):
+                for rid in to_del: delete_row(rid)
+                _ensure_cells(); _snapshot(); st.experimental_rerun()
+        with rcols[1]:
+            # Run per selected rows (honors selected columns below)
+            SS.setdefault("row_run_selection", [])
+            SS["row_run_selection"] = st.multiselect("Rows to run (from table)", options=[r["id"] for r in SS["grid"]["rows"]],
+                                                     format_func=lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid),
+                                                     key="row_run_selection_inline")
+        with rcols[2]:
+            # Quick add rows from missing sources
+            existing_table_sources = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="table"}
+            existing_pdf_sources   = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="pdf"}
+            add_tables = st.multiselect("Add CSV rows", options=[n for n in SS["tables"].keys() if n not in existing_table_sources], key="add_rows_csv_inline")
+        with rcols[3]:
+            add_pdfs   = st.multiselect("Add PDF rows", options=[n for n in SS["docs"].keys() if n not in existing_pdf_sources], key="add_rows_pdf_inline")
+
+        cadd1, cadd2 = st.columns(2)
+        with cadd1:
+            if st.button("Add selected CSV/PDF rows"):
+                for n in st.session_state.get("add_rows_csv_inline", []): _add_row_from_table(n)
+                for n in st.session_state.get("add_rows_pdf_inline", []): _add_row_from_pdf(n)
+                _ensure_cells(); _snapshot(); st.experimental_rerun()
+        with cadd2:
+            st.caption("")
 
     st.markdown("---")
     st.markdown("**Columns**")
@@ -593,15 +674,15 @@ with st.expander("Manage rows & columns", expanded=False):
         with cols[0]:
             c["name"] = st.text_input(f"Column label ({c['tool']})", c["name"], key=f"colname_{c['id']}")
         with cols[1]:
-            if st.button("⬆️ Up", key=f"up_{c['id']}"): move_col(c["id"], "up"); _ensure_cells(); st.experimental_rerun()
+            if st.button("⬆️ Up", key=f"up_{c['id']}"): move_col(c["id"], "up"); _ensure_cells(); _snapshot(); st.experimental_rerun()
         with cols[2]:
-            if st.button("⬇️ Down", key=f"dn_{c['id']}"): move_col(c["id"], "down"); _ensure_cells(); st.experimental_rerun()
+            if st.button("⬇️ Down", key=f"dn_{c['id']}"): move_col(c["id"], "down"); _ensure_cells(); _snapshot(); st.experimental_rerun()
         with cols[3]:
             st.caption("csv" if MODULES[c["tool"]]["applies_to"]==["table"] else "pdf")
         with cols[4]:
-            if st.button("🗑️ Delete", key=f"delcol_{c['id']}"): delete_col(c["id"]); _ensure_cells(); st.experimental_rerun()
+            if st.button("🗑️ Delete", key=f"delcol_{c['id']}"): delete_col(c["id"]); _ensure_cells(); _snapshot(); st.experimental_rerun()
 
-# -------------------- 4) Run Cells --------------------
+# ------------- 4) Run Cells -------------
 st.subheader("4) Run Cells")
 
 force_rerun = st.toggle("Force re-run (ignore cache)", value=False)
@@ -648,31 +729,36 @@ def _run_cell(cell: Dict[str,Any], force: bool=False):
         res: ModuleResult = cached["result"]
     else:
         cell["status"] = "running"
-        if row["type"] == "table":
-            df = SS["tables"].get(row["source"])
-            mapping = SS["schema_map"].get(row["source"], {})
-            if col["tool"] == "cohort_retention":
-                res = module_cohort_retention(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
-            elif col["tool"] == "pricing_power":
-                res = module_pricing_power(df, mapping.get("price"), mapping.get("quantity"))
-            elif col["tool"] == "nrr_grr":
-                res = module_nrr_grr(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
-            elif col["tool"] == "pdf_kpi_extract":
-                res = ModuleResult({}, "PDF module requires a PDF row.", [])
+        try:
+            if row["type"] == "table":
+                df = SS["tables"].get(row["source"])
+                mapping = SS["schema_map"].get(row["source"], {})
+                if col["tool"] == "cohort_retention":
+                    res = module_cohort_retention(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
+                elif col["tool"] == "pricing_power":
+                    res = module_pricing_power(df, mapping.get("price"), mapping.get("quantity"))
+                elif col["tool"] == "nrr_grr":
+                    res = module_nrr_grr(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
+                elif col["tool"] == "pdf_kpi_extract":
+                    res = ModuleResult({}, "PDF module requires a PDF row.", [])
+                else:
+                    res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
             else:
-                res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
-        else:
-            pages = SS["docs"].get(row["source"], [])
-            if col["tool"] == "pdf_kpi_extract":
-                res = module_pdf_kpi(pages)
-            elif col["tool"] in ("cohort_retention","pricing_power","nrr_grr"):
-                res = ModuleResult({}, f"{MODULES[col['tool']]['title']} applies to CSV rows.", [])
-            else:
-                res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
-        SS["cache"][cell["id"]] = {"sig": sig, "result": res}
+                pages = SS["docs"].get(row["source"], [])
+                if col["tool"] == "pdf_kpi_extract":
+                    res = module_pdf_kpi(pages)
+                elif col["tool"] in ("cohort_retention","pricing_power","nrr_grr"):
+                    res = ModuleResult({}, f"{MODULES[col['tool']]['title']} applies to CSV rows.", [])
+                else:
+                    res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
+            SS["cache"][cell["id"]] = {"sig": sig, "result": res}
+        except Exception as e:
+            res = ModuleResult({}, f"Error: {e}", [])
+            cell["status"] = "error"
 
     # write result into cell
-    cell["status"] = "done" if res.kpis else "needs_review"
+    if cell.get("status") != "error":
+        cell["status"] = "done" if res.kpis else "needs_review"
     cell["output_text"] = res.narrative
     v = None
     if res.kpis:
@@ -687,7 +773,7 @@ def _run_cell(cell: Dict[str,Any], force: bool=False):
     cell["figure2"] = res.figure2
     _log("CELL_RUN", f"{row['row_ref']} × {col['name']} → {cell['status']}")
 
-c1,c2,c3 = st.columns(3)
+c1,c2,c3,c4 = st.columns(4)
 with c1:
     if st.button("Run selection"):
         _ensure_cells()
@@ -701,14 +787,21 @@ with c2:
         for cell in SS["grid"]["cells"]: _run_cell(cell, force=force_rerun)
         st.success(f"Ran {len(SS['grid']['cells'])} cell(s).")
 with c3:
+    if st.button("Run selected Rows (from manager)"):
+        _ensure_cells()
+        row_ids = SS.get("row_run_selection", [])
+        targets = [c for c in SS["grid"]["cells"] if c["row_id"] in row_ids and (not sel_cols or c["col_id"] in sel_cols)]
+        for cell in targets: _run_cell(cell, force=force_rerun)
+        st.success(f"Ran {len(targets)} cell(s) for selected rows.")
+with c4:
     def _request_clear():
         st.session_state["do_clear_selection"] = True
         try: st.rerun()
         except: st.experimental_rerun()
     st.button("Clear selection", on_click=_request_clear)
 
-# -------------------- 4.1 Results with filters + bulk actions --------------------
-st.subheader("4.1 Results (investor view)")
+# ------------- Saved Views -------------
+st.subheader("4.1 Saved Views & Filters")
 
 def _cells_df():
     g = SS["grid"]
@@ -738,67 +831,55 @@ else:
     row_types = sorted(df_all["row_type"].dropna().unique().tolist())
     col_names = sorted(df_all["Column"].dropna().unique().tolist())
 
-    f1,f2,f3,f4 = st.columns([0.32,0.24,0.30,0.14])
+    f1,f2,f3,f4,f5 = st.columns([0.24,0.22,0.28,0.14,0.12])
     with f1:
-        sel_status = st.multiselect("Filter by status", options=statuses, default=statuses, key="flt_status")
+        sel_status = st.multiselect("Status", options=statuses, default=statuses, key="flt_status")
     with f2:
         sel_rowtype = st.multiselect("Row type", options=row_types, default=row_types, key="flt_rtype")
     with f3:
         sel_colname = st.multiselect("Columns", options=col_names, default=col_names, key="flt_cols")
     with f4:
-        st.caption("")
+        SS["attention_only"] = st.toggle("Attention only", value=SS["attention_only"], help="Show Needs-review/Error only")
+    with f5:
+        view_ops = ["(none)"] + sorted(SS["views"].keys())
+        chosen = st.selectbox("Saved view", options=view_ops)
+        if chosen and chosen!="(none)" and st.button("Apply view"):
+            v = SS["views"][chosen]
+            st.session_state["flt_status"] = v["status"]; st.session_state["flt_rtype"] = v["row_type"]; st.session_state["flt_cols"] = v["columns"]
+            SS["attention_only"] = v.get("attention_only", False)
+            st.experimental_rerun()
 
+    # apply filters
     df_view = df_all[
-        df_all["status"].isin(sel_status)
-        & df_all["row_type"].isin(sel_rowtype)
-        & df_all["Column"].isin(sel_colname)
+        df_all["status"].isin(st.session_state["flt_status"])
+        & df_all["row_type"].isin(st.session_state["flt_rtype"])
+        & df_all["Column"].isin(st.session_state["flt_cols"])
     ].copy()
+    if SS["attention_only"]:
+        df_view = df_view[df_view["status"].isin(["needs_review","error"])]
 
     st.dataframe(df_view[["Row","row_type","Column","status","Value","Summary"]], hide_index=True, use_container_width=True)
 
-    bA,bB,bC = st.columns([0.25,0.25,0.50])
-    with bA:
-        if st.button("Approve all in view"):
-            ids = set(df_view["id"].tolist())
-            for c in SS["grid"]["cells"]:
-                if c["id"] in ids: c["status"]="approved"
-            _log("BULK_APPROVE", f"{len(ids)}"); st.success("Approved.")
-    with bB:
-        if st.button("Mark needs-review in view"):
-            ids = set(df_view["id"].tolist())
-            for c in SS["grid"]["cells"]:
-                if c["id"] in ids: c["status"]="needs_review"
-            _log("BULK_REVIEW", f"{len(ids)}"); st.warning("Marked needs-review.")
-    with bC:
+    sv1, sv2, sv3 = st.columns([0.35,0.25,0.40])
+    with sv1:
+        new_name = st.text_input("Save current filters as view", value="")
+        if st.button("Save view") and new_name.strip():
+            SS["views"][new_name.strip()] = {
+                "status": st.session_state["flt_status"],
+                "row_type": st.session_state["flt_rtype"],
+                "columns": st.session_state["flt_cols"],
+                "attention_only": SS["attention_only"],
+            }
+            st.success(f"Saved view '{new_name.strip()}'")
+    with sv2:
+        del_name = st.selectbox("Delete view", options=["(choose)"]+sorted(SS["views"].keys()))
+        if st.button("Delete view") and del_name and del_name!="(choose)":
+            SS["views"].pop(del_name, None); st.success(f"Deleted '{del_name}'")
+    with sv3:
         csv_bytes = df_view.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Export results (filtered CSV)", data=csv_bytes, file_name="grid_results_filtered.csv", mime="text/csv")
 
-    # ---------- Quick manage inline ----------
-    with st.expander("Quick manage (add/delete without leaving this page)", expanded=False):
-        row_alias = lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid)
-        col_name  = lambda cid: next((c["name"] for c in SS["grid"]["columns"] if c["id"]==cid), cid)
-        st.markdown("**Add rows**")
-        existing_table_sources = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="table"}
-        existing_pdf_sources   = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="pdf"}
-        add_tables = st.multiselect("From CSVs", options=[n for n in SS["tables"].keys() if n not in existing_table_sources])
-        add_pdfs   = st.multiselect("From PDFs", options=[n for n in SS["docs"].keys() if n not in existing_pdf_sources])
-        if st.button("Add selected rows"):
-            for n in add_tables: _add_row_from_table(n)
-            for n in add_pdfs:   _add_row_from_pdf(n)
-            _ensure_cells(); st.experimental_rerun()
-        st.markdown("---")
-        st.markdown("**Delete rows**")
-        del_rows = st.multiselect("Pick rows to delete", options=[r["id"] for r in SS["grid"]["rows"]], format_func=row_alias, key="inline_del_rows")
-        if st.button("Delete selected row(s)"):
-            for rid in del_rows: delete_row(rid)
-            _ensure_cells(); st.experimental_rerun()
-        st.markdown("**Delete columns**")
-        del_cols = st.multiselect("Pick columns to delete", options=[c["id"] for c in SS["grid"]["columns"]], format_func=col_name, key="inline_del_cols")
-        if st.button("Delete selected column(s)"):
-            for cid in del_cols: delete_col(cid)
-            _ensure_cells(); st.experimental_rerun()
-
-# -------------------- 5) Review --------------------
+# ------------- 5) Review -------------
 st.subheader("5) Review")
 if SS["grid"]["cells"]:
     sel_cell_id = st.selectbox("Choose a cell", options=[c["id"] for c in SS["grid"]["cells"]], index=0)
@@ -819,17 +900,17 @@ if SS["grid"]["cells"]:
         with st.expander("KPIs"): st.json(cell.get("kpis", {}))
         with st.expander("Citations"): st.json(cell.get("citations", []))
 
-    if next((True for cc in SS["grid"]["columns"] if cc["id"]==cell["col_id"] and cc["tool"]=="pricing_power"), False):
+    if col["tool"] == "pricing_power":
         st.markdown("### 💡 Pricing Uplift Simulator")
         eps = cell.get("kpis", {}).get("elasticity")
         if isinstance(eps,(int,float)):
             pct = st.slider("Proposed average price change (%)", min_value=-30, max_value=30, value=5, step=1)
             dp = pct/100.0; rev_change = (1+dp)**(1+eps) - 1
-            st.write(f"Estimated revenue change: **{_fmt_pct(rev_change)}**** given ε≈{eps:.2f}")
+            st.write(f"Estimated revenue change: **{_fmt_pct(rev_change)}** given ε≈{eps:.2f}")
         else:
             st.info("Run Pricing Power to compute elasticity first.")
 
-    if next((True for cc in SS["grid"]["columns"] if cc["id"]==cell["col_id"] and cc["tool"]=="nrr_grr"), False):
+    if col["tool"] == "nrr_grr":
         k = cell.get("kpis", {})
         if k:
             st.markdown(f"**Latest month** · GRR {_fmt_pct(k.get('grr'))}, NRR {_fmt_pct(k.get('nrr'))} · "
@@ -843,7 +924,7 @@ if SS["grid"]["cells"]:
 else:
     st.info("No cells to review yet.")
 
-# -------------------- 6) Memo & Export --------------------
+# ------------- 6) Memo & Export -------------
 st.subheader("6) Compose Memo & Export (with cross-checks)")
 
 def _csv_revenue_total() -> Optional[float]:
@@ -898,8 +979,6 @@ def _cross_checks() -> List[Tuple[str,str]]:
 def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) -> bytes:
     rows = {r["id"]: r for r in grid["rows"]}
     cols = {c["id"]: c for c in grid["columns"]}
-
-    # memo column picker (defaults to all columns)
     selected_cols = SS.get("memo_cols")
     approved = [c for c in cells if c.get("status") == "approved" and (selected_cols is None or c["col_id"] in selected_cols)]
 
@@ -950,9 +1029,8 @@ def export_memo_pdf_friendly(grid: Dict[str,Any], cells: List[Dict[str,Any]]) ->
     c.showPage(); c.save(); buf.seek(0); return buf.getvalue()
 
 left,right = st.columns([1,1])
-
-# Column picker UI
 all_cols = SS["grid"]["columns"]
+
 with left:
     st.markdown("**Memo columns**")
     memo_cols = st.multiselect(
@@ -971,28 +1049,40 @@ with right:
     st.download_button("📄 Download Investor Memo (clean)", data=pdf_bytes,
                        file_name=f"TransformAI_Memo_{SS['grid']['id']}.pdf", mime="application/pdf")
 
-# Compose markdown preview (optional)
-if st.button("Compose (show markdown)"):
-    approved = [c for c in SS["grid"]["cells"] if c.get("status")=="approved"
-                and (SS["memo_cols"] is None or c["col_id"] in SS["memo_cols"])]
-    lines = [f"# Investment Memo — {SS['grid']['id']}", ""]
-    checks = _cross_checks()
-    if checks:
-        lines.append("## Cross-checks (PDF vs CSV)")
-        for label,msg in checks: lines.append(f"- **{label}**: {msg}")
-        lines.append("")
-    lines.append("## Executive Summary")
-    for ccell in approved:
-        col = next(x for x in SS["grid"]["columns"] if x["id"]==ccell["col_id"])
-        row = next(x for x in SS["grid"]["rows"] if x["id"]==ccell["row_id"])
-        val = ccell.get("numeric_value"); u = ccell.get("units")
-        val_s = _fmt_pct(val) if (u=="pct" and isinstance(val,(int,float))) else (f"{val:,.2f}" if isinstance(val,(int,float)) else "")
-        lines.append(f"- **{col['name']}** on _{row.get('alias') or row['row_ref']}_ → {val_s} — {ccell.get('output_text','')}")
-    SS["last_memo_md"] = "\n".join(lines) or "# (no approved findings)"
-    st.code(SS["last_memo_md"], language="markdown")
+# ------------- Config Export/Import -------------
+st.subheader("7) Grid Config — Export / Import")
+cfg_l, cfg_r = st.columns(2)
+with cfg_l:
+    if st.button("Export config (JSON)"):
+        cfg = {
+            "grid": {
+                "id": SS["grid"]["id"],
+                "rows": SS["grid"]["rows"],
+                "columns": SS["grid"]["columns"],
+            },
+            "schema_map": SS["schema_map"],
+            "views": SS["views"]
+        }
+        st.download_button("⬇️ Download grid_config.json", data=json.dumps(cfg, indent=2).encode("utf-8"),
+                           file_name="grid_config.json", mime="application/json")
+with cfg_r:
+    upcfg = st.file_uploader("Import config (grid_config.json)", type=["json"], key="cfg_up")
+    if upcfg and st.button("Apply imported config"):
+        try:
+            cfg = json.load(upcfg)
+            SS["grid"]["rows"] = cfg["grid"]["rows"]
+            SS["grid"]["columns"] = cfg["grid"]["columns"]
+            SS["grid"]["cells"] = []
+            SS["schema_map"] = cfg.get("schema_map", {})
+            SS["views"] = cfg.get("views", {})
+            _ensure_cells(); _snapshot()
+            st.success("Config applied.")
+            st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Import failed: {e}")
 
-# -------------------- 7) Evidence Chat (beta) --------------------
-st.subheader("7) Evidence Chat (beta)")
+# ------------- 8) Evidence Chat (beta) -------------
+st.subheader("8) Evidence Chat (beta)")
 scope = st.radio("Search scope", options=["All","PDFs","CSVs"], horizontal=True)
 
 def _score(text: str, q: str) -> int:
@@ -1058,7 +1148,6 @@ for role, content in SS["chat_history"]:
 
 prompt = st.chat_input("Ask about your evidence (e.g., 'show EBITDA', 'pages about churn', 'which CSV has price?' )")
 if prompt:
-    # FIX: put `with st.chat_message` on its own line (no semicolon before with)
     SS["chat_history"].append(("user", prompt))
     with st.chat_message("user"):
         st.markdown(prompt)
