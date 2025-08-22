@@ -1,13 +1,9 @@
 # pages/3_Diligence_Grid_Pro.py
-# TransformAI — Diligence Grid (Pro) — Next Phase Upgrade
-# - Saved Views (filters)
-# - Template Grids (CDD/QofE)
-# - Attention-only toggle (needs_review/error)
-# - Applicability warnings
-# - Inline Row/Column Manager with Undo/Redo
-# - Export/Import grid config (rows/columns/schema_map)
-# - Row manager with bulk delete + run-per-row
-# - Keeps Cohort, Pricing, NRR/GRR, PDF KPI modules and Memo export
+# TransformAI — Diligence Grid (Pro) — with Unit Economics + QoE label fix
+# - New module: unit_economics (CSV)
+# - Schema mapping: adds cogs, variable_cost, fixed_cost, marketing_spend, new_customers
+# - Template rename: "QoE (Quality of Earnings)"
+# - Keeps Cohort, Pricing, NRR/GRR, PDF KPI modules, Saved Views, Memo export
 
 from __future__ import annotations
 import io, uuid, re, textwrap, hashlib, json, copy
@@ -55,7 +51,7 @@ SS.setdefault("grid", {
     "activities": []
 })
 
-# ------------- utilities & history -------------
+# ---------- utilities ----------
 def _log(action:str, detail:str=""):
     SS["grid"]["activities"].append({"id": uuid.uuid4().hex, "action": action, "detail": detail})
 
@@ -72,13 +68,10 @@ def _fmt_pct(x: Optional[float]) -> str:
     return f"{x*100:.1f}%"
 
 def _snapshot():
-    """Push a deep copy snapshot for undo/redo."""
     snap = {
         "grid": copy.deepcopy(SS["grid"]),
         "schema_map": copy.deepcopy(SS["schema_map"]),
-        "cache": {}  # skip heavy cache; will recompute
     }
-    # truncate any future redos
     if SS["history_idx"] < len(SS["history"]) - 1:
         SS["history"] = SS["history"][:SS["history_idx"]+1]
     SS["history"].append(snap)
@@ -102,7 +95,7 @@ def _redo():
     SS["cache"].clear()
     return True
 
-# ------------- grid helpers -------------
+# ---------- grid helpers ----------
 def _add_row_from_table(name:str):
     rid = _new_id("row")
     SS["grid"]["rows"].append({"id": rid, "row_ref": f"table:{name}", "source": name, "type": "table", "alias": f"{name} (Transactions)"})
@@ -140,7 +133,7 @@ def move_col(col_id: str, direction: str):
     if direction=="down" and idx < len(cols)-1: cols[idx+1], cols[idx] = cols[idx], cols[idx+1]
     _log("COLUMN_MOVED", f"{col_id}:{direction}")
 
-# ------------- modules -------------
+# ---------- modules ----------
 @dataclass
 class ModuleResult:
     kpis: Dict[str, Any]
@@ -157,7 +150,14 @@ def _find(df: pd.DataFrame, key: str) -> Optional[str]:
         "revenue":  ["revenue","amount","net_revenue","sales","gmv","value"],
         "price":    ["price","unit_price","avg_price","p"],
         "quantity": ["qty","quantity","units","volume","q"],
-        "segment":  ["segment","sku","product","category","plan","region","cohort","family"]
+        "segment":  ["segment","sku","product","category","plan","region","cohort","family"],
+        # new for Unit Econ:
+        "cogs":             ["cogs","cost_of_goods","costofgoods","cost","cos"],
+        "variable_cost":    ["variable_cost","var_cost","transaction_fees","shipping","processing_fees","fulfillment"],
+        "fixed_cost":       ["fixed_cost","fixed","overhead","rent","payroll","opex","sg&a","sga","overheads"],
+        "marketing_spend":  ["marketing_spend","marketing","ad_spend","paid","cac_spend","sales_marketing","s&m","sam"],
+        "new_customers":    ["new_customers","acquisitions","new_logos","signups","new_accounts","new_buyers"],
+        "active_customers": ["active_customers","active_users","active_accounts","actives"]
     }.get(key.lower(), [key.lower()])
     cols = list(df.columns); lower = {c.lower(): c for c in cols}
     for needle in bank:
@@ -437,14 +437,155 @@ def module_pdf_kpi(pages: List[str]) -> ModuleResult:
         if v: citations.append({"type":"pdf","page":v["page"],"excerpt":(v["snippet"] or "")[:220]})
     return ModuleResult(kpis=kpis, narrative=narrative, citations=citations)
 
+# --- Unit Economics (NEW) ---
+def module_unit_economics(
+    df: pd.DataFrame,
+    ts_col: Optional[str]=None,
+    revenue_col: Optional[str]=None,
+    cogs_col: Optional[str]=None,
+    var_col: Optional[str]=None,
+    fixed_col: Optional[str]=None,
+    mkt_col: Optional[str]=None,
+    new_cust_col: Optional[str]=None,
+    customer_col: Optional[str]=None,
+    active_col: Optional[str]=None,
+) -> ModuleResult:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ModuleResult({}, "Empty dataset.", [])
+    ts_col       = ts_col       or _find(df, "date")
+    revenue_col  = revenue_col  or _find(df, "revenue")
+    cogs_col     = cogs_col     or _find(df, "cogs")
+    var_col      = var_col      or _find(df, "variable_cost")
+    fixed_col    = fixed_col    or _find(df, "fixed_cost")
+    mkt_col      = mkt_col      or _find(df, "marketing_spend")
+    new_cust_col = new_cust_col or _find(df, "new_customers")
+    customer_col = customer_col or _find(df, "customer")
+    active_col   = active_col   or _find(df, "active_customers")
+
+    if not (ts_col and revenue_col):
+        return ModuleResult({}, "Need at least date + revenue columns; map schema first.", [])
+
+    d = df.copy()
+    d[ts_col] = pd.to_datetime(d[ts_col], errors="coerce")
+    d = d.dropna(subset=[ts_col, revenue_col])
+    d["month"] = d[ts_col].dt.to_period("M")
+
+    agg = d.groupby("month", as_index=False)[revenue_col].sum().rename(columns={revenue_col: "revenue"})
+    for col, name in [(cogs_col, "cogs"), (var_col,"variable_cost"), (fixed_col,"fixed_cost"), (mkt_col,"marketing_spend")]:
+        if col and col in d.columns:
+            s = d.groupby("month", as_index=False)[col].sum().rename(columns={col: name})
+            agg = agg.merge(s, on="month", how="left")
+    for k in ["cogs","variable_cost","fixed_cost","marketing_spend"]:
+        if k not in agg.columns: agg[k] = 0.0
+
+    # Active and new customers
+    if active_col and active_col in d.columns:
+        active = d.groupby("month", as_index=False)[active_col].sum().rename(columns={active_col:"active_customers"})
+        agg = agg.merge(active, on="month", how="left")
+    elif customer_col and customer_col in d.columns:
+        # Active = unique customers with any revenue in month
+        act = d.groupby(["month"])[customer_col].nunique().reset_index().rename(columns={customer_col:"active_customers"})
+        agg = agg.merge(act, on="month", how="left")
+    else:
+        agg["active_customers"] = np.nan
+
+    if new_cust_col and new_cust_col in d.columns:
+        newc = d.groupby("month", as_index=False)[new_cust_col].sum().rename(columns={new_cust_col:"new_customers"})
+        agg = agg.merge(newc, on="month", how="left")
+    elif customer_col and customer_col in d.columns:
+        first_month = d.groupby(customer_col)[ts_col].min().dt.to_period("M")
+        d_first = pd.DataFrame({customer_col: first_month.index, "first_month": first_month.values})
+        newc = d_first.groupby("first_month")[customer_col].count().rename("new_customers").reset_index().rename(columns={"first_month":"month"})
+        agg = agg.merge(newc, on="month", how="left")
+    else:
+        agg["new_customers"] = np.nan
+
+    # Derived
+    agg["cm1"] = agg["revenue"] - agg["cogs"]
+    agg["cm2"] = agg["cm1"] - agg["variable_cost"]
+    agg["ebitda_proxy"] = agg["cm2"] - agg["fixed_cost"]
+    agg["gm_pct"] = np.where(agg["revenue"]>0, agg["cm1"]/agg["revenue"], np.nan)
+    agg["cm2_pct"] = np.where(agg["revenue"]>0, agg["cm2"]/agg["revenue"], np.nan)
+    agg["arpu"] = np.where(agg["active_customers"]>0, agg["revenue"]/agg["active_customers"], np.nan)
+    agg["cac"] = np.where(agg["new_customers"]>0, agg["marketing_spend"]/agg["new_customers"], np.nan)
+    # LTV proxy & Payback (very simple): LTV ≈ 12 * ARPU * GM%; Payback ≈ CAC / (ARPU*GM%)
+    agg["ltv_proxy"] = 12 * agg["arpu"] * agg["gm_pct"]
+    agg["payback_months"] = np.where((agg["arpu"]*agg["gm_pct"])>0, agg["cac"]/(agg["arpu"]*agg["gm_pct"]), np.nan)
+
+    # Choose latest month with revenue
+    agg = agg.sort_values("month")
+    latest = agg[agg["revenue"]>0].tail(1)
+    if latest.empty:
+        return ModuleResult({}, "No revenue rows to compute Unit Economics.", [])
+
+    L = latest.iloc[0].to_dict()
+    mlabel = str(L["month"])
+
+    # Waterfall (Rev → COGS → Variable → Fixed → EBITDA proxy)
+    wf_data = [
+        dict(name="Revenue", measure="absolute", y=float(L["revenue"])),
+        dict(name="COGS", measure="relative", y=-float(L["cogs"])),
+        dict(name="Variable", measure="relative", y=-float(L["variable_cost"])),
+        dict(name="Fixed", measure="relative", y=-float(L["fixed_cost"])),
+        dict(name="EBITDA*", measure="total", y=float(L["ebitda_proxy"])),
+    ]
+    fig_wf = go.Figure(go.Waterfall(
+        name=f"Unit Econ {mlabel}",
+        orientation="v",
+        measure=[d["measure"] for d in wf_data],
+        x=[d["name"] for d in wf_data],
+        y=[d["y"] for d in wf_data]
+    ))
+    fig_wf.update_layout(title=f"Unit Economics Waterfall — {mlabel}", yaxis_title="USD")
+
+    # Margin trend lines
+    fig_margins = go.Figure()
+    fig_margins.add_trace(go.Scatter(x=[str(x) for x in agg["month"]], y=agg["gm_pct"], mode="lines+markers", name="CM1 margin"))
+    fig_margins.add_trace(go.Scatter(x=[str(x) for x in agg["month"]], y=agg["cm2_pct"], mode="lines+markers", name="CM2 margin"))
+    fig_margins.update_layout(title="Margins over time", yaxis=dict(tickformat=".0%"))
+
+    kpis = {
+        "month": mlabel,
+        "cm1_margin": float(L["gm_pct"]) if L["gm_pct"]==L["gm_pct"] else None,
+        "cm2_margin": float(L["cm2_pct"]) if L["cm2_pct"]==L["cm2_pct"] else None,
+        "ebitda_proxy": float(L["ebitda_proxy"]),
+        "arpu": float(L["arpu"]) if L["arpu"]==L["arpu"] else None,
+        "cac": float(L["cac"]) if L["cac"]==L["cac"] else None,
+        "ltv_proxy": float(L["ltv_proxy"]) if L["ltv_proxy"]==L["ltv_proxy"] else None,
+        "payback_months": float(L["payback_months"]) if L["payback_months"]==L["payback_months"] else None,
+        "active_customers": float(L["active_customers"]) if L["active_customers"]==L["active_customers"] else None,
+        "new_customers": float(L["new_customers"]) if L["new_customers"]==L["new_customers"] else None,
+        "revenue": float(L["revenue"]),
+    }
+
+    msg = [f"{mlabel}: CM1 {_fmt_pct(kpis['cm1_margin']) if kpis['cm1_margin'] is not None else '-'};"
+           f" CM2 {_fmt_pct(kpis['cm2_margin']) if kpis['cm2_margin'] is not None else '-'};"
+           f" EBITDA* {_fmt_money(kpis['ebitda_proxy'])}."]
+    if kpis["cac"] is not None:
+        msg.append(f" CAC ~ {_fmt_money(kpis['cac'])}.")
+    if kpis["ltv_proxy"] is not None:
+        msg.append(f" LTV proxy ~ {_fmt_money(kpis['ltv_proxy'])}.")
+    if kpis["payback_months"] is not None:
+        msg.append(f" Payback ~ {kpis['payback_months']:.1f} mo.")
+    narrative = " ".join(msg) + " (EBITDA* is a proxy; depends on mapping quality.)"
+
+    return ModuleResult(
+        kpis=kpis,
+        narrative=narrative,
+        citations=[{"type":"table","ref":"(uploaded CSV)","selector":"monthly revenue/COGS/costs/marketing/new_customers"}],
+        figure=fig_wf,
+        figure2=fig_margins
+    )
+
 MODULES = {
     "cohort_retention": {"title": "Cohort Retention (CSV)", "fn": module_cohort_retention, "needs": ["customer", "date"], "optional": ["revenue"], "applies_to": ["table"]},
     "pricing_power":    {"title": "Pricing Power (CSV)",    "fn": module_pricing_power,    "needs": ["price", "quantity"], "optional": [], "applies_to": ["table"]},
     "nrr_grr":          {"title": "NRR/GRR (CSV)",          "fn": module_nrr_grr,          "needs": ["customer", "date", "revenue"], "optional": [], "applies_to": ["table"]},
+    "unit_economics":   {"title": "Unit Economics (CSV)",   "fn": module_unit_economics,    "needs": ["date","revenue"], "optional": ["cogs","variable_cost","fixed_cost","marketing_spend","new_customers","customer","active_customers"], "applies_to": ["table"]},
     "pdf_kpi_extract":  {"title": "PDF KPI Extract",        "fn": module_pdf_kpi,          "needs": [], "optional": [], "applies_to": ["pdf"]},
 }
 
-# ------------- 1) Evidence Sources -------------
+# ---------- 1) Evidence Sources ----------
 st.subheader("1) Evidence Sources")
 c_csv, c_pdf = st.columns(2)
 
@@ -455,7 +596,10 @@ with c_csv:
             try:
                 df = pd.read_csv(f)
                 SS["tables"][f.name] = df
-                SS["schema_map"].setdefault(f.name, {"customer":None,"date":None,"revenue":None,"price":None,"quantity":None})
+                SS["schema_map"].setdefault(f.name, {
+                    "customer":None,"date":None,"revenue":None,"price":None,"quantity":None,
+                    "cogs":None,"variable_cost":None,"fixed_cost":None,"marketing_spend":None,"new_customers":None,"active_customers":None
+                })
                 _log("SOURCE_ADDED", f"csv:{f.name}")
                 st.success(f"Loaded CSV: {f.name} ({df.shape[0]:,} rows)")
                 _snapshot()
@@ -478,11 +622,16 @@ with c_pdf:
             st.success(f"Loaded PDF: {f.name} ({len(pages)} pages)")
             _snapshot()
 
-# ------------- 2) Map CSV Schema -------------
+# ---------- 2) Map CSV Schema ----------
 with st.expander("2) Map CSV Schema", expanded=False):
     def _auto_guess(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-        return {"customer": _find(df,"customer"), "date": _find(df,"date"),
-                "revenue": _find(df,"revenue"), "price": _find(df,"price"), "quantity": _find(df,"quantity")}
+        return {
+            "customer": _find(df,"customer"), "date": _find(df,"date"),
+            "revenue": _find(df,"revenue"), "price": _find(df,"price"), "quantity": _find(df,"quantity"),
+            "cogs": _find(df,"cogs"), "variable_cost": _find(df,"variable_cost"),
+            "fixed_cost": _find(df,"fixed_cost"), "marketing_spend": _find(df,"marketing_spend"),
+            "new_customers": _find(df,"new_customers"), "active_customers": _find(df,"active_customers")
+        }
     if st.button("Auto-map all tables"):
         for name, df in SS["tables"].items():
             SS["schema_map"][name] = _auto_guess(df)
@@ -492,17 +641,35 @@ with st.expander("2) Map CSV Schema", expanded=False):
         st.markdown(f"**{name}** — {df.shape[0]:,} rows × {df.shape[1]:,} cols")
         cols = list(df.columns)
         cur = SS["schema_map"].get(name) or _auto_guess(df)
+
         c1,c2,c3,c4,c5 = st.columns(5)
         with c1:
-            customer = st.selectbox(f"{name}: Customer", ["(none)"]+cols, index=(cols.index(cur["customer"])+1) if cur.get("customer") in cols else 0, key=f"cust_{name}")
+            customer = st.selectbox(f"{name}: Customer", ["(none)"]+cols, index=(cols.index(cur.get("customer"))+1) if cur.get("customer") in cols else 0, key=f"cust_{name}")
         with c2:
-            date = st.selectbox(f"{name}: Date", ["(none)"]+cols, index=(cols.index(cur["date"])+1) if cur.get("date") in cols else 0, key=f"date_{name}")
+            date = st.selectbox(f"{name}: Date", ["(none)"]+cols, index=(cols.index(cur.get("date"))+1) if cur.get("date") in cols else 0, key=f"date_{name}")
         with c3:
-            revenue = st.selectbox(f"{name}: Revenue", ["(none)"]+cols, index=(cols.index(cur["revenue"])+1) if cur.get("revenue") in cols else 0, key=f"rev_{name}")
+            revenue = st.selectbox(f"{name}: Revenue", ["(none)"]+cols, index=(cols.index(cur.get("revenue"))+1) if cur.get("revenue") in cols else 0, key=f"rev_{name}")
         with c4:
-            price = st.selectbox(f"{name}: Price", ["(none)"]+cols, index=(cols.index(cur["price"])+1) if cur.get("price") in cols else 0, key=f"price_{name}")
+            price = st.selectbox(f"{name}: Price", ["(none)"]+cols, index=(cols.index(cur.get("price"))+1) if cur.get("price") in cols else 0, key=f"price_{name}")
         with c5:
-            qty = st.selectbox(f"{name}: Quantity", ["(none)"]+cols, index=(cols.index(cur["quantity"])+1) if cur.get("quantity") in cols else 0, key=f"qty_{name}")
+            qty = st.selectbox(f"{name}: Quantity", ["(none)"]+cols, index=(cols.index(cur.get("quantity"))+1) if cur.get("quantity") in cols else 0, key=f"qty_{name}")
+
+        c6,c7,c8,c9,c10 = st.columns(5)
+        with c6:
+            cogs = st.selectbox(f"{name}: COGS", ["(none)"]+cols, index=(cols.index(cur.get("cogs"))+1) if cur.get("cogs") in cols else 0, key=f"cogs_{name}")
+        with c7:
+            varc = st.selectbox(f"{name}: Variable cost", ["(none)"]+cols, index=(cols.index(cur.get("variable_cost"))+1) if cur.get("variable_cost") in cols else 0, key=f"var_{name}")
+        with c8:
+            fixc = st.selectbox(f"{name}: Fixed cost", ["(none)"]+cols, index=(cols.index(cur.get("fixed_cost"))+1) if cur.get("fixed_cost") in cols else 0, key=f"fix_{name}")
+        with c9:
+            mkt = st.selectbox(f"{name}: Marketing spend", ["(none)"]+cols, index=(cols.index(cur.get("marketing_spend"))+1) if cur.get("marketing_spend") in cols else 0, key=f"mkt_{name}")
+        with c10:
+            newc = st.selectbox(f"{name}: New customers", ["(none)"]+cols, index=(cols.index(cur.get("new_customers"))+1) if cur.get("new_customers") in cols else 0, key=f"newc_{name}")
+
+        c11,_ = st.columns([0.5,0.5])
+        with c11:
+            active = st.selectbox(f"{name}: Active customers", ["(none)"]+cols, index=(cols.index(cur.get("active_customers"))+1) if cur.get("active_customers") in cols else 0, key=f"active_{name}")
+
         if st.button(f"Save mapping for {name}", key=f"save_{name}"):
             SS["schema_map"][name] = {
                 "customer": None if customer=="(none)" else customer,
@@ -510,10 +677,16 @@ with st.expander("2) Map CSV Schema", expanded=False):
                 "revenue":  None if revenue=="(none)" else revenue,
                 "price":    None if price=="(none)" else price,
                 "quantity": None if qty=="(none)" else qty,
+                "cogs": None if cogs=="(none)" else cogs,
+                "variable_cost": None if varc=="(none)" else varc,
+                "fixed_cost": None if fixc=="(none)" else fixc,
+                "marketing_spend": None if mkt=="(none)" else mkt,
+                "new_customers": None if newc=="(none)" else newc,
+                "active_customers": None if active=="(none)" else active,
             }
             _log("SCHEMA_SAVED", name); _snapshot(); st.success("Saved.")
 
-# ------------- compatibility + cells -------------
+# ---------- compatibility + cells ----------
 def _prune_incompatible_cells() -> int:
     rows_by_id = {r["id"]: r for r in SS["grid"]["rows"]}
     cols_by_id = {c["id"]: c for c in SS["grid"]["columns"]}
@@ -550,7 +723,7 @@ def _ensure_cells():
                 })
     return dropped
 
-# ------------- 3) Build Grid -------------
+# ---------- 3) Build Grid ----------
 st.subheader("3) Build Grid")
 top_l, top_r = st.columns([0.7, 0.3])
 
@@ -567,15 +740,16 @@ with top_l:
             dropped = _ensure_cells(); _snapshot()
             st.success(f"Added PDF rows. Skipped {dropped} incompatible cells." if dropped else "Added PDF rows.")
     with b3:
-        if st.button("Add Starter Columns (all 4)"):
+        if st.button("Add Starter Columns (all 5)"):
             for name, tool in [("Cohort Retention","cohort_retention"),
                                ("Pricing Power","pricing_power"),
                                ("NRR/GRR","nrr_grr"),
+                               ("Unit Economics","unit_economics"),
                                ("PDF KPIs","pdf_kpi_extract")]:
                 _add_column(name, tool, {})
             dropped = _ensure_cells(); _snapshot()
             if dropped: st.warning(f"Added, but {dropped} cell slots were inapplicable and skipped.")
-            else: st.success("Added 4 starter columns.")
+            else: st.success("Added starter columns.")
     with b4:
         if st.button("Add Starter Columns (matching rows)"):
             has_csv = any(r["type"]=="table" for r in SS["grid"]["rows"])
@@ -585,7 +759,8 @@ with top_l:
             if has_csv:
                 for name,tool in [("Cohort Retention","cohort_retention"),
                                   ("Pricing Power","pricing_power"),
-                                  ("NRR/GRR","nrr_grr")]:
+                                  ("NRR/GRR","nrr_grr"),
+                                  ("Unit Economics","unit_economics")]:
                     if tool not in existing_tools:
                         _add_column(name, tool, {}); added += 1
             if has_pdf and "pdf_kpi_extract" not in existing_tools:
@@ -595,23 +770,22 @@ with top_l:
 
 with top_r:
     st.markdown("**Quick Template Grid**")
-    tmpl = st.selectbox("Template", options=["(choose)","CDD (Customer DD)","QofE (Quant of Earnings)"])
+    tmpl = st.selectbox("Template", options=["(choose)","CDD (Customer DD)","QoE (Quality of Earnings)"])
     if st.button("Apply Template"):
         if tmpl == "CDD (Customer DD)":
-            # CDD focus: cohorts, NRR/GRR, PDF KPIs
-            for t in ["cohort_retention","nrr_grr","pdf_kpi_extract"]:
+            for t in ["cohort_retention","nrr_grr","unit_economics","pdf_kpi_extract"]:
                 if t not in {c["tool"] for c in SS["grid"]["columns"]}:
-                    _add_column({"cohort_retention":"Cohort Retention","nrr_grr":"NRR/GRR","pdf_kpi_extract":"PDF KPIs"}[t], t, {})
-        elif tmpl == "QofE (Quant of Earnings)":
-            # QofE wedge: pricing, PDF KPIs, NRR/GRR
-            for t in ["pricing_power","pdf_kpi_extract","nrr_grr"]:
+                    label = {"cohort_retention":"Cohort Retention","nrr_grr":"NRR/GRR","unit_economics":"Unit Economics","pdf_kpi_extract":"PDF KPIs"}[t]
+                    _add_column(label, t, {})
+        elif tmpl == "QoE (Quality of Earnings)":
+            for t in ["unit_economics","pricing_power","pdf_kpi_extract","nrr_grr"]:
                 if t not in {c["tool"] for c in SS["grid"]["columns"]}:
-                    _add_column({"pricing_power":"Pricing Power","pdf_kpi_extract":"PDF KPIs","nrr_grr":"NRR/GRR"}[t], t, {})
+                    label = {"unit_economics":"Unit Economics","pricing_power":"Pricing Power","pdf_kpi_extract":"PDF KPIs","nrr_grr":"NRR/GRR"}[t]
+                    _add_column(label, t, {})
         dropped = _ensure_cells(); _snapshot()
         st.success(f"Template applied; skipped {dropped} inapplicable cells." if dropped else "Template applied.")
 
-# Add arbitrary column
-col_name = st.text_input("New column label", value="PDF KPIs")
+col_name = st.text_input("New column label", value="Unit Economics")
 tool_key = st.selectbox("Module", options=list(MODULES.keys()), format_func=lambda k: MODULES[k]["title"])
 if st.button("Add Column"):
     _add_column(col_name, tool_key, params={})
@@ -619,7 +793,6 @@ if st.button("Add Column"):
     if dropped: st.warning(f"Added, but skipped {dropped} inapplicable cell slots.")
     else: st.success(f"Added column: {col_name} [{tool_key}]")
 
-# Manage rows/columns with Undo/Redo
 with st.expander("Manage rows & columns (with Undo/Redo)", expanded=False):
     u1,u2,u3 = st.columns([0.15,0.15,0.70])
     with u1:
@@ -634,7 +807,6 @@ with st.expander("Manage rows & columns (with Undo/Redo)", expanded=False):
         st.caption("Undo/Redo applies to grid structure and schema mapping.")
 
     st.markdown("**Rows**")
-    # Bulk row manager
     if SS["grid"]["rows"]:
         rm_df = pd.DataFrame([{"Row ID": r["id"], "Alias": r.get("alias") or r["row_ref"], "Type": r["type"], "Source": r["source"], "Delete?": False} for r in SS["grid"]["rows"]])
         edited = st.data_editor(rm_df, num_rows="dynamic", use_container_width=True, key="row_mgr")
@@ -645,13 +817,11 @@ with st.expander("Manage rows & columns (with Undo/Redo)", expanded=False):
                 for rid in to_del: delete_row(rid)
                 _ensure_cells(); _snapshot(); st.experimental_rerun()
         with rcols[1]:
-            # Run per selected rows (honors selected columns below)
             SS.setdefault("row_run_selection", [])
             SS["row_run_selection"] = st.multiselect("Rows to run (from table)", options=[r["id"] for r in SS["grid"]["rows"]],
                                                      format_func=lambda rid: next((r.get("alias") or r["row_ref"] for r in SS["grid"]["rows"] if r["id"]==rid), rid),
                                                      key="row_run_selection_inline")
         with rcols[2]:
-            # Quick add rows from missing sources
             existing_table_sources = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="table"}
             existing_pdf_sources   = {r["source"] for r in SS["grid"]["rows"] if r["type"]=="pdf"}
             add_tables = st.multiselect("Add CSV rows", options=[n for n in SS["tables"].keys() if n not in existing_table_sources], key="add_rows_csv_inline")
@@ -682,9 +852,8 @@ with st.expander("Manage rows & columns (with Undo/Redo)", expanded=False):
         with cols[4]:
             if st.button("🗑️ Delete", key=f"delcol_{c['id']}"): delete_col(c["id"]); _ensure_cells(); _snapshot(); st.experimental_rerun()
 
-# ------------- 4) Run Cells -------------
+# ---------- 4) Run Cells ----------
 st.subheader("4) Run Cells")
-
 force_rerun = st.toggle("Force re-run (ignore cache)", value=False)
 
 if SS.get("do_clear_selection"):
@@ -722,7 +891,6 @@ def _run_cell(cell: Dict[str,Any], force: bool=False):
     row = next(x for x in SS["grid"]["rows"] if x["id"]==cell["row_id"])
     col = next(x for x in SS["grid"]["columns"] if x["id"]==cell["col_id"])
 
-    # cache key / signature
     sig = f"{_sig_for_row(row)}|{col['tool']}|{str(SS['schema_map'].get(row['source'], {}))}"
     cached = SS["cache"].get(cell["id"])
     if cached and (cached.get("sig")==sig) and not force:
@@ -739,6 +907,19 @@ def _run_cell(cell: Dict[str,Any], force: bool=False):
                     res = module_pricing_power(df, mapping.get("price"), mapping.get("quantity"))
                 elif col["tool"] == "nrr_grr":
                     res = module_nrr_grr(df, mapping.get("customer"), mapping.get("date"), mapping.get("revenue"))
+                elif col["tool"] == "unit_economics":
+                    res = module_unit_economics(
+                        df,
+                        ts_col=mapping.get("date"),
+                        revenue_col=mapping.get("revenue"),
+                        cogs_col=mapping.get("cogs"),
+                        var_col=mapping.get("variable_cost"),
+                        fixed_col=mapping.get("fixed_cost"),
+                        mkt_col=mapping.get("marketing_spend"),
+                        new_cust_col=mapping.get("new_customers"),
+                        customer_col=mapping.get("customer"),
+                        active_col=mapping.get("active_customers"),
+                    )
                 elif col["tool"] == "pdf_kpi_extract":
                     res = ModuleResult({}, "PDF module requires a PDF row.", [])
                 else:
@@ -747,7 +928,7 @@ def _run_cell(cell: Dict[str,Any], force: bool=False):
                 pages = SS["docs"].get(row["source"], [])
                 if col["tool"] == "pdf_kpi_extract":
                     res = module_pdf_kpi(pages)
-                elif col["tool"] in ("cohort_retention","pricing_power","nrr_grr"):
+                elif col["tool"] in ("cohort_retention","pricing_power","nrr_grr","unit_economics"):
                     res = ModuleResult({}, f"{MODULES[col['tool']]['title']} applies to CSV rows.", [])
                 else:
                     res = ModuleResult({}, f"Unknown tool {col['tool']}", [])
@@ -756,7 +937,6 @@ def _run_cell(cell: Dict[str,Any], force: bool=False):
             res = ModuleResult({}, f"Error: {e}", [])
             cell["status"] = "error"
 
-    # write result into cell
     if cell.get("status") != "error":
         cell["status"] = "done" if res.kpis else "needs_review"
     cell["output_text"] = res.narrative
@@ -800,7 +980,7 @@ with c4:
         except: st.experimental_rerun()
     st.button("Clear selection", on_click=_request_clear)
 
-# ------------- Saved Views -------------
+# ---------- 4.1 Saved Views & Filters ----------
 st.subheader("4.1 Saved Views & Filters")
 
 def _cells_df():
@@ -849,7 +1029,6 @@ else:
             SS["attention_only"] = v.get("attention_only", False)
             st.experimental_rerun()
 
-    # apply filters
     df_view = df_all[
         df_all["status"].isin(st.session_state["flt_status"])
         & df_all["row_type"].isin(st.session_state["flt_rtype"])
@@ -879,7 +1058,7 @@ else:
         csv_bytes = df_view.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Export results (filtered CSV)", data=csv_bytes, file_name="grid_results_filtered.csv", mime="text/csv")
 
-# ------------- 5) Review -------------
+# ---------- 5) Review ----------
 st.subheader("5) Review")
 if SS["grid"]["cells"]:
     sel_cell_id = st.selectbox("Choose a cell", options=[c["id"] for c in SS["grid"]["cells"]], index=0)
@@ -924,7 +1103,7 @@ if SS["grid"]["cells"]:
 else:
     st.info("No cells to review yet.")
 
-# ------------- 6) Memo & Export -------------
+# ---------- 6) Compose Memo & Export ----------
 st.subheader("6) Compose Memo & Export (with cross-checks)")
 
 def _csv_revenue_total() -> Optional[float]:
@@ -1049,7 +1228,7 @@ with right:
     st.download_button("📄 Download Investor Memo (clean)", data=pdf_bytes,
                        file_name=f"TransformAI_Memo_{SS['grid']['id']}.pdf", mime="application/pdf")
 
-# ------------- Config Export/Import -------------
+# ---------- 7) Grid Config ----------
 st.subheader("7) Grid Config — Export / Import")
 cfg_l, cfg_r = st.columns(2)
 with cfg_l:
@@ -1081,7 +1260,7 @@ with cfg_r:
         except Exception as e:
             st.error(f"Import failed: {e}")
 
-# ------------- 8) Evidence Chat (beta) -------------
+# ---------- 8) Evidence Chat (beta) ----------
 st.subheader("8) Evidence Chat (beta)")
 scope = st.radio("Search scope", options=["All","PDFs","CSVs"], horizontal=True)
 
