@@ -1,10 +1,8 @@
 # pages/3_Diligence_Grid_Pro.py
 # Transform AI — Diligence Grid (Pro)
-# Adds: PVM Bridge module, Approvals, Evidence drawer, Run budget, Sidebar what-ifs
-# (Your original structure preserved; targeted fixes for:
-#  - Matrix shows PVM Bridge column
-#  - Evidence & Sources visible under charts (expanded by default)
-#  - Pricing vs PVM charts fully separated)
+# Adds: PMV Bridge module, Approvals, Evidence drawer, Run budget, Sidebar what-ifs
+# Also: Auto data-quality checks & cleaning on CSV upload (dedupe, neg revenue, missing core fields)
+# (Structure preserved; only PMV + data checks added)
 
 from __future__ import annotations
 import io, json, time, uuid
@@ -66,9 +64,10 @@ SS = st.session_state
 # Helpers / State
 # ---------------------------------------------------------------------------
 def ensure_state():
-    SS.setdefault("csv_files", {})             # {name: df}
+    SS.setdefault("csv_files", {})             # {name: df} (CLEANED)
     SS.setdefault("pdf_files", {})             # {name: bytes}
     SS.setdefault("schema", {})                # {csv_name: {canonical: source_col or None}}
+    SS.setdefault("data_checks", {})           # {csv_name: report dict}
 
     SS.setdefault("rows", [])                  # [{id, alias, row_type ('table'|'pdf'), source}]
     SS.setdefault("columns", [])               # [{id, label, module}]
@@ -194,6 +193,105 @@ def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         "revenue":     pick("revenue","net_revenue","amount","sales"),
         "product":     pick("product","sku","item","category"),
     }
+
+def _auto_clean_csv(df: pd.DataFrame, guess: Dict[str, Optional[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Auto-detect & fix: exact duplicates, negative revenue, missing core fields, bad dates.
+       Only removes rows when we're confident (exact key duplicates, non-positive revenue, missing core)."""
+    report: Dict[str, Any] = {}
+    before = int(len(df))
+    df2 = df.copy()
+
+    # Helper: resolve guessed column if present
+    col = lambda k: guess.get(k) if guess.get(k) in df2.columns else None
+
+    # Coerce order_date to datetime (if exists)
+    od = col("order_date")
+    if od:
+        pre_na = int(df2[od].isna().sum()) if od in df2.columns else 0
+        df2[od] = pd.to_datetime(df2[od], errors="coerce")
+        report["coerced_bad_dates_to_NaT"] = max(int(df2[od].isna().sum()) - pre_na, 0)
+
+    # Working revenue series for validation
+    rev = col("revenue")
+    amt = col("amount")
+    prc = col("price")
+    qty = col("quantity")
+
+    work_rev = None
+    if rev and rev in df2.columns:
+        work_rev = pd.to_numeric(df2[rev], errors="coerce")
+        report["revenue_source"] = "revenue"
+    elif amt and amt in df2.columns:
+        work_rev = pd.to_numeric(df2[amt], errors="coerce")
+        report["revenue_source"] = "amount"
+    elif prc and qty and prc in df2.columns and qty in df2.columns:
+        with np.errstate(invalid="ignore"):
+            work_rev = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
+        report["revenue_source"] = "price*quantity"
+    else:
+        report["revenue_source"] = "none"
+
+    # Fill quantity if missing
+    if qty and qty in df2.columns:
+        filled_qty = int(df2[qty].isna().sum())
+        df2[qty] = df2[qty].fillna(1)
+        report["filled_missing_quantity_to_1"] = filled_qty
+
+    # Build a strong duplicate key (only using columns that exist)
+    key_cols: List[str] = []
+    if col("customer_id"): key_cols.append(col("customer_id"))
+    if col("order_date"):  key_cols.append(col("order_date"))
+    if amt and amt in df2.columns:
+        key_cols.append(amt)
+    else:
+        if prc and prc in df2.columns: key_cols.append(prc)
+        if qty and qty in df2.columns: key_cols.append(qty)
+    if col("product"): key_cols.append(col("product"))
+
+    dropped_dupes = 0
+    if key_cols:
+        dup_mask = df2.duplicated(subset=key_cols, keep="first")
+        dropped_dupes = int(dup_mask.sum())
+        if dropped_dupes > 0:
+            df2 = df2.loc[~dup_mask].copy()
+    report["dropped_exact_duplicates_on_keys"] = {"keys": key_cols, "rows": dropped_dupes}
+
+    # Drop rows with missing *core* fields (customer_id or order_date)
+    drop_core = 0
+    cid = col("customer_id")
+    if cid or od:
+        mask_core = pd.Series(False, index=df2.index)
+        if cid and cid in df2.columns:
+            mask_core |= df2[cid].isna() | (df2[cid].astype(str).str.strip()=="")
+        if od and od in df2.columns:
+            mask_core |= df2[od].isna()
+        drop_core = int(mask_core.sum())
+        if drop_core > 0:
+            df2 = df2.loc[~mask_core].copy()
+    report["dropped_missing_core_fields"] = drop_core
+
+    # Remove rows with non-positive revenue (likely refunds/voids) — conservative
+    dropped_nonpos_rev = 0
+    wr = None
+    if rev and rev in df2.columns:
+        wr = pd.to_numeric(df2[rev], errors="coerce")
+    elif amt and amt in df2.columns:
+        wr = pd.to_numeric(df2[amt], errors="coerce")
+    elif prc and qty and prc in df2.columns and qty in df2.columns:
+        wr = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
+    if wr is not None:
+        mask = (wr <= 0) | wr.isna()
+        dropped_nonpos_rev = int(mask.sum())
+        if dropped_nonpos_rev > 0:
+            df2 = df2.loc[~mask].copy()
+    report["dropped_non_positive_revenue_rows"] = dropped_nonpos_rev
+
+    report["rows_before"] = before
+    report["rows_after"]  = int(len(df2))
+    report["rows_removed_total"] = before - int(len(df2))
+
+    return df2, report
+
 
 def materialize_df(csv_name: str) -> pd.DataFrame:
     df = SS["csv_files"].get(csv_name, pd.DataFrame()).copy()
@@ -885,14 +983,19 @@ with tab_data:
     with c1:
         csvs = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True)
         if csvs:
+            loaded = 0
             for f in csvs:
                 try:
-                    df = pd.read_csv(f)
+                    raw_df = pd.read_csv(f)
                 except Exception:
-                    df = pd.read_csv(io.BytesIO(f.getvalue()))
-                SS["csv_files"][f.name] = df
-                SS["schema"].setdefault(f.name, _auto_guess_schema(df))
-            st.success(f"Loaded {len(csvs)} CSV file(s).")
+                    raw_df = pd.read_csv(io.BytesIO(f.getvalue()))
+                guess = _auto_guess_schema(raw_df)
+                cleaned_df, report = _auto_clean_csv(raw_df, guess)
+                SS["csv_files"][f.name] = cleaned_df        # store CLEANED
+                SS["schema"].setdefault(f.name, guess)      # keep guess editable
+                SS["data_checks"][f.name] = report          # store report
+                loaded += 1
+            st.success(f"Loaded {loaded} CSV file(s) (auto-clean applied).")
 
     with c2:
         pdfs = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
@@ -921,6 +1024,27 @@ with tab_data:
             pick("Revenue (period revenue)", "revenue")
             pick("Product", "product")
             st.divider()
+
+    # New: Data quality reports
+    with st.expander("Data Quality Reports (auto)", expanded=True if SS["data_checks"] else False):
+        if not SS["data_checks"]:
+            st.caption("Upload CSVs to see automatic cleaning results here.")
+        else:
+            for name, rep in SS["data_checks"].items():
+                st.markdown(f"**{name}**")
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Rows (before)", rep.get("rows_before", 0))
+                c2.metric("Rows (after)", rep.get("rows_after", 0))
+                c3.metric("Removed (total)", rep.get("rows_removed_total", 0))
+                src = rep.get("revenue_source","none")
+                c4.metric("Revenue source", src)
+                st.write("- Dropped duplicates on keys:", rep.get("dropped_exact_duplicates_on_keys", {}).get("keys", []),
+                         "→", rep.get("dropped_exact_duplicates_on_keys", {}).get("rows", 0))
+                st.write("- Dropped missing core fields:", rep.get("dropped_missing_core_fields", 0))
+                st.write("- Dropped non-positive revenue rows:", rep.get("dropped_non_positive_revenue_rows", 0))
+                st.write("- Coerced bad dates → NaT:", rep.get("coerced_bad_dates_to_NaT", 0))
+                st.write("- Filled missing quantity to 1:", rep.get("filled_missing_quantity_to_1", 0))
+                st.divider()
 
     st.write("**Loaded CSVs:**", list(SS["csv_files"].keys()) or "—")
     st.write("**Loaded PDFs:**", list(SS["pdf_files"].keys()) or "—")
@@ -1239,3 +1363,4 @@ with tab_memo:
         st.write("Use **Run → Export APPROVED memo PDF (demo)** to preview.")
     else:
         st.info("Install `reportlab` to enable PDF export.")
+
