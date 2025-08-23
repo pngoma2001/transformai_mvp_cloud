@@ -1,6 +1,7 @@
 # pages/3_Diligence_Grid_Pro.py
 # Transform AI — Diligence Grid (Pro)
 # Adds: PVM Bridge module, Approvals, Evidence drawer, Run budget, Sidebar what-ifs
+# + CSV Data Quality audit & cleaning (dupes/missing/negatives)  <<< ADDED
 
 from __future__ import annotations
 import io, json, time, uuid
@@ -88,6 +89,10 @@ def ensure_state():
     # undo/redo snapshots
     SS.setdefault("undo", [])
     SS.setdefault("redo", [])
+
+    # >>> ADDED: CSV audit state & default cleaning choices (per file)
+    SS.setdefault("csv_audit", {})             # {name: audit_dict}
+    SS.setdefault("csv_clean_opts", {})        # {name: {"drop_dupes":..., "drop_missing":..., "drop_neg_revenue":...}}
 
 ensure_state()
 
@@ -227,6 +232,145 @@ def materialize_df(csv_name: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# >>> ADDED: CSV Data Quality (audit + cleaning helpers)
+# ---------------------------------------------------------------------------
+def _resolve_keys_for_dupes(schema: Dict[str, Optional[str]], df_cols: List[str]) -> List[str]:
+    """
+    Choose a 'genuine duplicate' key-set, preferring customer_id + order_date + amount/revenue.
+    Falls back safely to any subset that exists.
+    """
+    keys = []
+    if schema.get("customer_id") in df_cols: keys.append(schema.get("customer_id"))
+    if schema.get("order_date") in df_cols:  keys.append(schema.get("order_date"))
+    rev_key = schema.get("revenue") if schema.get("revenue") in df_cols else schema.get("amount")
+    if rev_key in df_cols: keys.append(rev_key)
+    # If too few keys, try price+quantity instead of amount
+    if len(keys) < 2:
+        if schema.get("price") in df_cols: keys.append(schema.get("price"))
+        if schema.get("quantity") in df_cols: keys.append(schema.get("quantity"))
+    # Ensure unique, preserve order
+    seen, uniq = set(), []
+    for k in keys:
+        if k and k not in seen:
+            uniq.append(k); seen.add(k)
+    return uniq
+
+def audit_csv(df: pd.DataFrame, schema: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """
+    Returns a dict with counts & sample indices for:
+      - duplicates (by composite key)
+      - missing essentials (customer_id/order_date/(revenue|amount))
+      - negative revenue/amount
+      - invalid order_date parse
+    """
+    result = {
+        "rows": int(len(df)),
+        "duplicates": 0,
+        "duplicate_key": [],
+        "duplicate_idx": [],
+        "missing_essentials": 0,
+        "missing_idx": [],
+        "neg_revenue": 0,
+        "neg_idx": [],
+        "invalid_dates": 0,
+        "invalid_date_idx": [],
+    }
+    if df.empty:
+        return result
+
+    cols = list(df.columns)
+    # Essentials
+    cust = schema.get("customer_id")
+    od   = schema.get("order_date")
+    rev  = schema.get("revenue") if schema.get("revenue") in cols else schema.get("amount")
+
+    # Missing essentials
+    miss_mask = pd.Series(False, index=df.index)
+    essentials = []
+    if cust in cols:
+        miss_mask |= df[cust].isna() | (df[cust].astype(str).str.strip()=="")
+        essentials.append(cust)
+    if od in cols:
+        # do not parse yet—just missing string/NaN
+        miss_mask |= df[od].isna() | (df[od].astype(str).str.strip()=="")
+        essentials.append(od)
+    if rev in cols:
+        miss_mask |= df[rev].isna()
+        essentials.append(rev)
+
+    result["missing_essentials"] = int(miss_mask.sum())
+    result["missing_idx"] = df.index[miss_mask].astype(int).tolist()
+
+    # Invalid dates (parse)
+    invalid_date_mask = pd.Series(False, index=df.index)
+    if od in cols:
+        parsed = pd.to_datetime(df[od], errors="coerce")
+        invalid_date_mask = parsed.isna()
+        result["invalid_dates"] = int(invalid_date_mask.sum())
+        result["invalid_date_idx"] = df.index[invalid_date_mask].astype(int).tolist()
+
+    # Negative revenue
+    neg_mask = pd.Series(False, index=df.index)
+    if rev in cols:
+        with np.errstate(invalid="ignore"):
+            neg_mask = df[rev].astype(float) < 0
+        result["neg_revenue"] = int(neg_mask.sum())
+        result["neg_idx"] = df.index[neg_mask].astype(int).tolist()
+
+    # Duplicates by composite key
+    keyset = _resolve_keys_for_dupes(schema, cols)
+    if keyset:
+        dup_mask = df.duplicated(subset=keyset, keep="first")
+        result["duplicates"] = int(dup_mask.sum())
+        result["duplicate_key"] = keyset
+        result["duplicate_idx"] = df.index[dup_mask].astype(int).tolist()
+
+    return result
+
+def clean_csv(df: pd.DataFrame, schema: Dict[str, Optional[str]],
+              drop_dupes: bool = True,
+              drop_missing: bool = True,
+              drop_neg_revenue: bool = False) -> pd.DataFrame:
+    """Apply optional cleaning. Returns a new DataFrame."""
+    out = df.copy()
+    cols = list(out.columns)
+
+    # Drop invalid dates & fill missing essentials by dropping rows
+    cust = schema.get("customer_id")
+    od   = schema.get("order_date")
+    rev  = schema.get("revenue") if schema.get("revenue") in cols else schema.get("amount")
+
+    if drop_missing:
+        miss_mask = pd.Series(False, index=out.index)
+        if cust in cols:
+            miss_mask |= out[cust].isna() | (out[cust].astype(str).str.strip()=="")
+        if od in cols:
+            miss_mask |= out[od].isna() | (out[od].astype(str).str.strip()=="")
+        if rev in cols:
+            miss_mask |= out[rev].isna()
+        out = out.loc[~miss_mask].copy()
+
+        # also remove non-parseable dates for order_date
+        if od in cols:
+            parsed = pd.to_datetime(out[od], errors="coerce")
+            out = out.loc[~parsed.isna()].copy()
+
+    # Drop negative revenue/amount rows (treat as refunds if unchecked)
+    if drop_neg_revenue and rev in cols:
+        with np.errstate(invalid="ignore"):
+            out = out.loc[~(out[rev].astype(float) < 0)].copy()
+
+    # Drop exact duplicates by composite key
+    if drop_dupes:
+        keyset = _resolve_keys_for_dupes(schema, list(out.columns))
+        if keyset:
+            out = out.drop_duplicates(subset=keyset, keep="first")
+
+    return out
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Grid helpers
 # ---------------------------------------------------------------------------
 MODULES = [
@@ -330,43 +474,26 @@ def _pdf_kpis(_raw: bytes) -> Dict[str, Any]:
                   ]}
     )
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# REPLACED: real cohort retention math (first-purchase cohorts)
+# Real cohort retention math (first-purchase cohorts)
 def _cohort(
     df: pd.DataFrame,
     min_cohort_size: int = 10,
     horizon: int = 12
 ) -> Dict[str, Any]:
-    """
-    Cohort = customer's first purchase month.
-    Retention at month k = % of that cohort with >= 1 purchase in cohort_month + k.
-    - Ignores cohorts with size < min_cohort_size
-    - Caps horizon at `horizon` months
-    Returns: average retention curve (weighted by cohort size), heat matrix,
-             cohort labels + sizes, and evidence table (cohort, size, M0, M3).
-    """
     try:
-        # guard
         if not {"customer_id", "order_date"}.issubset(df.columns):
             raise ValueError("customer_id/order_date missing")
 
         d = df[["customer_id", "order_date"]].copy()
         d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
         d = d.dropna(subset=["customer_id", "order_date"])
-
-        # Period month columns (Period[M])
         d["month"] = d["order_date"].dt.to_period("M")
 
-        # First purchase cohort for each customer
         first = d.groupby("customer_id")["month"].min().rename("cohort")
         d = d.join(first, on="customer_id")
-
-        # Months since cohort (k)
-        # (PeriodIndex subtraction gives integer offsets)
         d["k"] = (d["month"].astype("int64") - d["cohort"].astype("int64"))
         d = d[(d["k"] >= 0) & (d["k"] < horizon)]
 
-        # Unique activity per cohort/customer/k (presence in that month)
         present = (
             d.drop_duplicates(["cohort", "customer_id", "k"])
              .groupby(["cohort", "k"])
@@ -374,10 +501,7 @@ def _cohort(
              .unstack(fill_value=0)
         )
 
-        # Cohort sizes = unique customers per cohort
         cohort_sizes = d.groupby("cohort")["customer_id"].nunique().rename("size")
-
-        # Align tables, keep only cohorts meeting size threshold
         keep_mask = cohort_sizes >= int(min_cohort_size)
         cohort_sizes = cohort_sizes[keep_mask]
         if cohort_sizes.empty:
@@ -386,18 +510,14 @@ def _cohort(
         cohorts = cohort_sizes.index.sort_values()
         k_cols = list(range(horizon))
         present = present.reindex(index=cohorts, columns=k_cols, fill_value=0)
-
-        # Retention matrix by cohort (rows) and k (cols)
         retention = present.div(cohort_sizes, axis=0).fillna(0)
 
-        # Weighted average curve across cohorts
         weights = cohort_sizes.loc[cohorts].astype(float).values
         denom = weights.sum()
         if denom <= 0:
             raise ValueError("Invalid weights")
         curve = (retention.mul(weights, axis=0).sum(axis=0) / denom).tolist()
 
-        # Evidence: table with cohort label, size, M0 (=1.0), M3
         m3_col = 3 if horizon > 3 else None
         ev = pd.DataFrame({
             "cohort": cohorts.astype(str).tolist(),
@@ -406,7 +526,6 @@ def _cohort(
             "M3": retention.loc[cohorts, 3].round(4).tolist() if m3_col is not None else [np.nan]*len(cohorts)
         })
 
-        # Output
         m3_avg = curve[3] if len(curve) > 3 else None
         return dict(
             value=m3_avg,
@@ -422,7 +541,6 @@ def _cohort(
                       "rows": int(ev.shape[0])}
         )
     except Exception:
-        # graceful fallback
         curve = [1.0, 0.9, 0.75, 0.6, 0.5, 0.42] + [0.38]*(horizon-6)
         m3 = curve[3]
         return dict(
@@ -431,14 +549,13 @@ def _cohort(
             summary=f"Retention stabilizes ~M3 at {m3:.0%} (fallback).",
             citations=[{"source":"csv","selector":"fallback"}]
         )
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 def _pricing(df: pd.DataFrame) -> Dict[str, Any]:
     try:
         d = df[["price","quantity"]].replace(0, np.nan).dropna()
         d = d[(d["price"]>0) & (d["quantity"]>0)]
         x = np.log(d["price"].astype(float)); y = np.log(d["quantity"].astype(float))
-        b, a = np.polyfit(x,y,1)  # y = b*x + a
+        b, a = np.polyfit(x,y,1)
         e = round(b,2)
         verdict = "inelastic" if abs(e)<1 else "elastic"
         fit_y = b*x + a
@@ -519,12 +636,10 @@ def _pvm_bridge(df: pd.DataFrame) -> Dict[str, Any]:
             d["order_date"] = pd.to_datetime(d["order_date"], errors="coerce")
             d["month"] = d["order_date"].dt.to_period("M").astype(str)
         d = d.dropna(subset=["price","quantity"])
-        # Aggregate by product & month
         g = d.groupby(["product","month"]).agg(
             qty=("quantity","sum"),
             rev=("revenue","sum") if "revenue" in d.columns else ("quantity","sum")
         ).reset_index()
-        # Derive avg price
         g["price"] = np.where(g["qty"]>0, g["rev"]/g["qty"], np.nan)
 
         months = sorted(g["month"].unique())
@@ -535,17 +650,14 @@ def _pvm_bridge(df: pd.DataFrame) -> Dict[str, Any]:
         B = g[g["month"]==b].set_index("product")
         products = sorted(set(A.index) | set(B.index))
 
-        # Fill missing
         for p in products:
             if p not in A.index: A.loc[p] = dict(qty=0, rev=0, price=np.nan, month=a)
             if p not in B.index: B.loc[p] = dict(qty=0, rev=0, price=np.nan, month=b)
         A = A.fillna(0); B = B.fillna(0)
 
-        # Base revenue at A mix/price/qty
         base_rev = float((A["price"] * A["qty"]).sum())
         price_effect = float(((B["price"] - A["price"]) * A["qty"]).sum())
         volume_effect = float((A["price"] * (B["qty"] - A["qty"])).sum())
-        # Mix effect as residual between actual delta and price+volume
         actual_delta = float((B["price"]*B["qty"]).sum() - base_rev)
         mix_effect = float(actual_delta - price_effect - volume_effect)
 
@@ -640,7 +752,6 @@ def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
     by_r = {r["id"]: r for r in SS["rows"]}
     by_c = {c["id"]: c for c in SS["columns"]}
 
-    # Pre-calc required cost
     required = 0
     calc_list = []
     for rid, cid in pairs:
@@ -660,14 +771,12 @@ def enqueue_pairs(pairs: List[Tuple[str,str]], respect_cache=True):
     if SS["spent_cents"] + required > SS["run_budget_cents"]:
         st.warning(f"Budget exceeded: need {required}¢, have {SS['run_budget_cents']-SS['spent_cents']}¢ remaining. "
                    f"Lower selection or raise the budget.")
-        # Still enqueue cached ones for UX
         for rid,cid,typ,c in calc_list:
             if typ=="cached":
                 SS["results"][(rid,cid)] = {**SS["results"][(rid,cid)], "status":"cached"}
                 SS["jobs"].append({"rid":rid,"cid":cid,"status":"cached","cost_cents":0,"started":now_ts(),"ended":now_ts(),"note":"cache"})
         return
 
-    # Enqueue
     for rid,cid,typ,c in calc_list:
         key = (rid,cid)
         if typ=="cached":
@@ -851,7 +960,6 @@ def plot_pvm(bridge: List[Dict[str, Any]]):
         return
     df = pd.DataFrame(bridge)
     if PLOTLY_OK:
-        # Waterfall-like: base then contributions
         base = df.iloc[0]["value"]
         steps = []
         running = base
@@ -861,7 +969,6 @@ def plot_pvm(bridge: List[Dict[str, Any]]):
             running += v
             steps.append(dict(name=df.iloc[i]["component"], value=v, type="relative"))
         steps.append(dict(name=df.iloc[-1]["component"], value=running-base, type="total"))
-        # Render as bar since plotly waterfall requires extra import; emulate:
         labels = [s["name"] for s in steps]
         vals = [s["value"] for s in steps]
         fig = go.Figure()
@@ -911,8 +1018,11 @@ with tab_data:
                     df = pd.read_csv(f)
                 except Exception:
                     df = pd.read_csv(io.BytesIO(f.getvalue()))
+                # Store raw then schema guess, then audit
                 SS["csv_files"][f.name] = df
-                SS["schema"].setdefault(f.name, _auto_guess_schema(df))
+                guessed = _auto_guess_schema(df)
+                sch = SS["schema"].setdefault(f.name, guessed)
+                SS["csv_audit"][f.name] = audit_csv(df, sch)   # <<< ADDED
             st.success(f"Loaded {len(csvs)} CSV file(s).")
 
     with c2:
@@ -941,7 +1051,49 @@ with tab_data:
             pick("Month (YYYY-MM)", "month")
             pick("Revenue (period revenue)", "revenue")
             pick("Product", "product")
-            st.divider()
+
+            # >>> ADDED: Data Quality & Cleaning UI per-file
+            with st.expander("Data Quality & Cleaning", expanded=True):
+                # Recompute audit when schema changes to use the right keys
+                audit = audit_csv(df, sch)
+                SS["csv_audit"][name] = audit
+
+                cA, cB, cC, cD = st.columns(4)
+                cA.metric("Rows", audit["rows"])
+                cB.metric("Duplicates", audit["duplicates"])
+                cC.metric("Missing essentials", audit["missing_essentials"])
+                cD.metric("Negative revenue", audit["neg_revenue"])
+                if audit.get("invalid_dates", 0) > 0:
+                    st.warning(f"Invalid dates: {audit['invalid_dates']}")
+
+                st.caption(f"Duplicate key used: {', '.join(audit['duplicate_key']) if audit['duplicate_key'] else 'n/a'}")
+
+                opts = SS["csv_clean_opts"].setdefault(
+                    name,
+                    {"drop_dupes": True, "drop_missing": True, "drop_neg_revenue": False}
+                )
+                cc1, cc2, cc3 = st.columns(3)
+                with cc1:
+                    opts["drop_dupes"] = st.checkbox("Drop duplicates", value=opts["drop_dupes"], key=f"{name}:dropdupes")
+                with cc2:
+                    opts["drop_missing"] = st.checkbox("Drop missing essentials & bad dates", value=opts["drop_missing"], key=f"{name}:dropmiss")
+                with cc3:
+                    opts["drop_neg_revenue"] = st.checkbox("Drop negative revenue rows", value=opts["drop_neg_revenue"], key=f"{name}:dropneg")
+
+                if st.button(f"Apply cleaning to {name}", key=f"clean:{name}"):
+                    before = len(df)
+                    cleaned = clean_csv(df, sch,
+                                        drop_dupes=opts["drop_dupes"],
+                                        drop_missing=opts["drop_missing"],
+                                        drop_neg_revenue=opts["drop_neg_revenue"])
+                    SS["csv_files"][name] = cleaned
+                    # refresh for display and downstream use
+                    df = cleaned
+                    audit = audit_csv(cleaned, sch)
+                    SS["csv_audit"][name] = audit
+                    st.success(f"Cleaned {name}: {before} → {len(cleaned)} rows")
+                st.divider()
+            # <<< END Data Quality
 
     st.write("**Loaded CSVs:**", list(SS["csv_files"].keys()) or "—")
     st.write("**Loaded PDFs:**", list(SS["pdf_files"].keys()) or "—")
@@ -968,7 +1120,6 @@ with tab_grid:
         with b2:
             if st.button("Redo", use_container_width=True): redo()
 
-    # Inline rows
     st.markdown("**Rows**")
     if SS["rows"]:
         df_rows = pd.DataFrame(SS["rows"])[["id","alias","row_type","source"]]
@@ -987,7 +1138,6 @@ with tab_grid:
     else:
         st.info("No rows yet. Add from CSVs/PDFs.")
 
-    # Inline columns
     st.markdown("**Columns**")
     if SS["columns"]:
         df_cols = pd.DataFrame(SS["columns"])[["id","label","module"]]
@@ -1006,7 +1156,6 @@ with tab_grid:
     else:
         st.caption("No columns yet. Add QoE Columns or create one below.")
 
-    # New column
     nc1, nc2, nc3 = st.columns([2,2,1])
     with nc1:
         new_label = st.text_input("New column label", value=SS.get("new_col_label","NRR/GRR"))
@@ -1055,7 +1204,6 @@ with tab_grid:
                 sel = set()
                 for mod in MODULES:
                     if mod in row and bool(row[mod]): sel.add(mod)
-                # PDF guard
                 if any(rr["id"]==rid and rr["row_type"]=="pdf" for rr in SS["rows"]):
                     sel = set(m for m in sel if m=="PDF KPIs (PDF)")
                 SS["matrix"][rid] = sel
@@ -1069,7 +1217,6 @@ with tab_run:
     st.subheader("Run — queue, process, and see status")
     st.toggle("Force re-run (ignore cache)", key="force_rerun", value=SS.get("force_rerun", False))
 
-    # One-click QoE
     with st.expander("One-click QoE", expanded=True):
         st.caption("Adds QoE columns (if missing), selects mapped pairs from Matrix, runs all within budget.")
         if st.button("Run QoE Now", type="primary"):
@@ -1086,7 +1233,6 @@ with tab_run:
             run_queued_jobs()
             st.success(f"Attempted to run {len(pairs)} cell(s). Check Jobs below for cache/budget statuses.")
 
-    # Manual by Matrix
     with st.expander("Manual run by Matrix selection", expanded=False):
         rows = SS["rows"]; cols = SS["columns"]
         by_mod = {c["module"]: c["id"] for c in cols}
@@ -1106,7 +1252,6 @@ with tab_run:
             st.info("Nothing mapped in Matrix yet.")
 
     st.divider()
-    # Jobs + quick exports
     if SS["jobs"]:
         st.markdown("**Jobs**")
         st.dataframe(pd.DataFrame(SS["jobs"]), use_container_width=True, height=200)
@@ -1123,7 +1268,6 @@ with tab_run:
 # --------------------------- SHEET (Agentic Spreadsheet) ---------------------
 with tab_sheet:
     st.subheader("Agentic Spreadsheet (status by cell)")
-    # pick QoE columns first; fall back to all columns if none
     qoe_cols = [c for c in SS["columns"] if c["module"] in {m for _,m in QOE_TEMPLATE}] or SS["columns"]
 
     header = ["Row"] + [c["label"] for c in qoe_cols]
@@ -1138,7 +1282,6 @@ with tab_sheet:
             if res.get("status") == "cached": mark = "⟲ cached"
             if res.get("status") == "error":  mark = "⚠ error"
             if not res: mark = ""
-            # show approval dot
             if keypair(r["id"],c["id"]) in SS["approved"]:
                 mark = "✅ " + (mark or "")
             row_vals.append(mark)
@@ -1155,7 +1298,6 @@ with tab_review:
     rows_by_id = {r["id"]: r for r in SS["rows"]}
     cols_by_id = {c["id"]: c for c in SS["columns"]}
 
-    # Row and Column selectors
     row_opt = [(r["id"], r["alias"]) for r in SS["rows"]]
     col_opt = [(c["id"], f"{c['label']}  ·  {c['module']}") for c in SS["columns"]]
 
@@ -1184,7 +1326,6 @@ with tab_review:
         res = SS["results"].get((rid, cid))
         r = rows_by_id.get(rid); c = cols_by_id.get(cid)
 
-        # Action to (re)run on demand
         if st.button("Run this cell now", type="primary"):
             enqueue_pairs([(rid, cid)], respect_cache=False)
             run_queued_jobs()
@@ -1198,7 +1339,6 @@ with tab_review:
 
             module = c["module"]
 
-            # Render only charts for this module
             if module == "Cohort Retention (CSV)" or "curve" in res:
                 colA, colB = st.columns(2)
                 with colA:
@@ -1206,8 +1346,7 @@ with tab_review:
                     plot_retention(res.get("curve", []))
                 with colB:
                     st.markdown("**Cohort heatmap**")
-                    # current heatmap uses curve; real matrix is available in res["heat"]
-                    plot_retention_heatmap(res.get("curve", []))
+                    plot_retention_heatmap(res.get("curve", []))  # (matrix also available in res["heat"])
 
             elif module == "NRR/GRR (CSV)":
                 st.markdown("**NRR / GRR by month**")
@@ -1235,7 +1374,6 @@ with tab_review:
                 if periods:
                     st.caption(f"Periods: {periods.get('from','?')} → {periods.get('to','?')}")
 
-            # Evidence drawer
             with st.expander("Evidence & Citations", expanded=False):
                 cits = res.get("citations", [])
                 if cits:
@@ -1259,3 +1397,4 @@ with tab_memo:
         st.write("Use **Run → Export APPROVED memo PDF (demo)** to preview.")
     else:
         st.info("Install `reportlab` to enable PDF export.")
+
