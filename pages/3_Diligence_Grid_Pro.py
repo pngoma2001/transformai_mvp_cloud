@@ -1,8 +1,8 @@
 # pages/3_Diligence_Grid_Pro.py
 # Transform AI — Diligence Grid (Pro)
 # Adds: PMV Bridge module, Approvals, Evidence drawer, Run budget, Sidebar what-ifs
-# Also: Auto data-quality checks & cleaning on CSV upload (dedupe, neg revenue, missing core fields)
-# (Structure preserved; only PMV + data checks added; non-positive revenue drop now flag-controlled)
+# Also: Auto data-quality checks & cleaning on CSV upload (dedupe, neg revenue (toggle), missing core fields)
+# (Structure preserved; only PMV + data checks + sidebar toggle added)
 
 from __future__ import annotations
 import io, json, time, uuid
@@ -11,11 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# ---------------- Flag: control dropping non-positive revenue rows ----------------
-# Set to True to DROP rows with non-positive revenue during auto-cleaning;
-# set to False to KEEP them.
-CLEANING_DROP_NONPOS_REVENUE = False
 
 # Optional PDF export
 try:
@@ -50,9 +45,12 @@ st.markdown(
 <style>
 .block-container {max-width: 1700px !important; padding-top: 0.5rem;}
 /* Fix header clipping + spacing */
-h1, .stMarkdown h1
-{ white-space: normal !important; overflow-wrap: anywhere !important;
-  line-height: 1.15 !important; margin-top: .25rem !important; }
+h1, .stMarkdown h1 {
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  line-height: 1.15 !important;
+  margin-top: .25rem !important;
+}
 .stDataFrame [role="checkbox"] {transform: scale(1.0);}
 </style>
 """,
@@ -63,10 +61,16 @@ SS = st.session_state
 
 
 # ---------------------------------------------------------------------------
+# Cleaning options (toggle default)
+# ---------------------------------------------------------------------------
+CLEANING_DROP_NONPOS_REVENUE = True  # default; can be overridden by sidebar toggle
+
+
+# ---------------------------------------------------------------------------
 # Helpers / State
 # ---------------------------------------------------------------------------
 def ensure_state():
-    SS.setdefault("csv_files", {})             # {name: df} (CLEANED)
+    SS.setdefault("csv_files", {})             # {name: df}  (CLEANED)
     SS.setdefault("pdf_files", {})             # {name: bytes}
     SS.setdefault("schema", {})                # {csv_name: {canonical: source_col or None}}
     SS.setdefault("data_checks", {})           # {csv_name: report dict}
@@ -85,6 +89,9 @@ def ensure_state():
     # What-if inputs (also surfaced in sidebar)
     SS.setdefault("whatif_gm", 0.62)
     SS.setdefault("whatif_cac", 42.0)
+
+    # Cleaning toggle remembered across runs
+    SS.setdefault("clean_drop_nonpos", CLEANING_DROP_NONPOS_REVENUE)
 
     # Budget (cents) and accounting
     SS.setdefault("run_budget_cents", 800)     # default budget for a run
@@ -175,7 +182,7 @@ def redo():
 
 
 # ---------------------------------------------------------------------------
-# Schema helpers
+# Schema helpers + cleaner
 # ---------------------------------------------------------------------------
 CANONICAL = ["customer_id","order_date","amount","price","quantity","month","revenue","product"]
 
@@ -201,50 +208,44 @@ def _auto_clean_csv(
     guess: Dict[str, Optional[str]],
     drop_nonpos_revenue: bool = CLEANING_DROP_NONPOS_REVENUE
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Auto-detect & fix: exact duplicates, negative revenue (optional drop),
-       missing core fields, bad dates.
-       Only removes rows when we're confident (exact key duplicates, optional non-positive revenue, missing core)."""
+    """Auto-detect & fix: exact duplicates, negative revenue (optional), missing core fields, bad dates."""
     report: Dict[str, Any] = {}
     before = int(len(df))
     df2 = df.copy()
 
-    # Helper: resolve guessed column if present
-    col = lambda k: guess.get(k) if guess.get(k) in df2.columns else None
+    # Helper to resolve guessed source columns
+    def col(k: str) -> Optional[str]:
+        v = guess.get(k)
+        return v if (v and v in df2.columns) else None
 
-    # Coerce order_date to datetime (if exists)
+    # Coerce order_date to datetime
     od = col("order_date")
     if od:
-        pre_na = int(df2[od].isna().sum()) if od in df2.columns else 0
+        prev_na = int(df2[od].isna().sum())
         df2[od] = pd.to_datetime(df2[od], errors="coerce")
-        report["coerced_bad_dates_to_NaT"] = max(int(df2[od].isna().sum()) - pre_na, 0)
+        report["coerced_bad_dates_to_NaT"] = max(int(df2[od].isna().sum()) - prev_na, 0)
 
-    # Working revenue series for validation
-    rev = col("revenue")
-    amt = col("amount")
-    prc = col("price")
-    qty = col("quantity")
+    # Work revenue
+    rev = col("revenue"); amt = col("amount"); prc = col("price"); qty = col("quantity")
+    if qty and qty in df2.columns:
+        missing_q = int(df2[qty].isna().sum())
+        df2[qty] = df2[qty].fillna(1)
+        report["filled_missing_quantity_to_1"] = missing_q
 
-    work_rev = None
     if rev and rev in df2.columns:
-        work_rev = pd.to_numeric(df2[rev], errors="coerce")
+        wr = pd.to_numeric(df2[rev], errors="coerce")
         report["revenue_source"] = "revenue"
     elif amt and amt in df2.columns:
-        work_rev = pd.to_numeric(df2[amt], errors="coerce")
+        wr = pd.to_numeric(df2[amt], errors="coerce")
         report["revenue_source"] = "amount"
     elif prc and qty and prc in df2.columns and qty in df2.columns:
-        with np.errstate(invalid="ignore"):
-            work_rev = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
+        wr = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
         report["revenue_source"] = "price*quantity"
     else:
+        wr = None
         report["revenue_source"] = "none"
 
-    # Fill quantity if missing
-    if qty and qty in df2.columns:
-        filled_qty = int(df2[qty].isna().sum())
-        df2[qty] = df2[qty].fillna(1)
-        report["filled_missing_quantity_to_1"] = filled_qty
-
-    # Build a strong duplicate key (only using columns that exist)
+    # Strong duplicate keys we actually have
     key_cols: List[str] = []
     if col("customer_id"): key_cols.append(col("customer_id"))
     if col("order_date"):  key_cols.append(col("order_date"))
@@ -263,7 +264,7 @@ def _auto_clean_csv(
             df2 = df2.loc[~dup_mask].copy()
     report["dropped_exact_duplicates_on_keys"] = {"keys": key_cols, "rows": dropped_dupes}
 
-    # Drop rows with missing *core* fields (customer_id or order_date)
+    # Drop rows with missing core fields (customer_id or order_date)
     drop_core = 0
     cid = col("customer_id")
     if cid or od:
@@ -277,24 +278,24 @@ def _auto_clean_csv(
             df2 = df2.loc[~mask_core].copy()
     report["dropped_missing_core_fields"] = drop_core
 
-    # Non-positive revenue rows — only drop if flag is True
+    # Optionally drop rows with non-positive revenue (refunds/voids)
     dropped_nonpos_rev = 0
-    wr = None
-    if rev and rev in df2.columns:
-        wr = pd.to_numeric(df2[rev], errors="coerce")
-    elif amt and amt in df2.columns:
-        wr = pd.to_numeric(df2[amt], errors="coerce")
-    elif prc and qty and prc in df2.columns and qty in df2.columns:
-        wr = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
-    if wr is not None:
-        mask = (wr <= 0) | wr.isna()
-        if drop_nonpos_revenue:
+    if drop_nonpos_revenue and wr is not None:
+        # recompute wr aligned to df2
+        if rev and rev in df2.columns:
+            wr2 = pd.to_numeric(df2[rev], errors="coerce")
+        elif amt and amt in df2.columns:
+            wr2 = pd.to_numeric(df2[amt], errors="coerce")
+        elif prc and qty and prc in df2.columns and qty in df2.columns:
+            wr2 = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
+        else:
+            wr2 = None
+        if wr2 is not None:
+            mask = (wr2 <= 0) | wr2.isna()
             dropped_nonpos_rev = int(mask.sum())
             if dropped_nonpos_rev > 0:
                 df2 = df2.loc[~mask].copy()
-        else:
-            dropped_nonpos_rev = 0
-    report["dropped_non_positive_revenue_rows"] = dropped_nonpos_rev
+    report["dropped_non_positive_revenue_rows"] = dropped_nonpos_rev if drop_nonpos_revenue else "skipped (toggle off)"
 
     report["rows_before"] = before
     report["rows_after"]  = int(len(df2))
@@ -441,7 +442,7 @@ def _pdf_kpis(_raw: bytes) -> Dict[str, Any]:
                   ]}
     )
 
-# --- Cohort (unchanged from your real math version) ---
+# --- Cohort (real math) ---
 def _cohort(df: pd.DataFrame, min_cohort_size: int = 10, horizon: int = 12) -> Dict[str, Any]:
     try:
         if not {"customer_id", "order_date"}.issubset(df.columns):
@@ -968,10 +969,16 @@ def plot_pmv(bridge: List[Dict[str, Any]]):
 
 
 # ---------------------------------------------------------------------------
-# Sidebar — What-ifs & Budget
+# Sidebar — What-ifs, Cleaning & Budget
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.subheader("What-ifs & Budget")
+    st.subheader("What-ifs, Cleaning & Budget")
+    # Toggle for cleaning behavior (visible control)
+    SS["clean_drop_nonpos"] = st.toggle(
+        "Drop non-positive revenue rows",
+        value=SS.get("clean_drop_nonpos", CLEANING_DROP_NONPOS_REVENUE),
+        help="When on, auto-cleaning removes rows where revenue ≤ 0 (or NaN)."
+    )
     SS["whatif_gm"] = st.number_input("Gross Margin (0–1)", min_value=0.0, max_value=1.0, step=0.01, value=float(SS.get("whatif_gm",0.62)))
     SS["whatif_cac"] = st.number_input("CAC ($)", min_value=0.0, step=1.0, value=float(SS.get("whatif_cac",42.0)))
     SS["run_budget_cents"] = st.number_input("Run budget (¢)", min_value=0, step=50, value=int(SS.get("run_budget_cents",800)))
@@ -1001,12 +1008,13 @@ with tab_data:
                     raw_df = pd.read_csv(io.BytesIO(f.getvalue()))
                 guess = _auto_guess_schema(raw_df)
                 cleaned_df, report = _auto_clean_csv(
-                    raw_df, guess,
-                    drop_nonpos_revenue=CLEANING_DROP_NONPOS_REVENUE
+                    raw_df,
+                    guess,
+                    drop_nonpos_revenue=SS.get("clean_drop_nonpos", CLEANING_DROP_NONPOS_REVENUE),
                 )
-                SS["csv_files"][f.name] = cleaned_df        # store CLEANED
-                SS["schema"].setdefault(f.name, guess)      # keep guess editable
-                SS["data_checks"][f.name] = report          # store report
+                SS["csv_files"][f.name] = cleaned_df
+                SS["schema"][f.name] = guess
+                SS["data_checks"][f.name] = report
                 loaded += 1
             st.success(f"Loaded {loaded} CSV file(s) (auto-clean applied).")
 
@@ -1016,6 +1024,14 @@ with tab_data:
             for f in pdfs:
                 SS["pdf_files"][f.name] = f.getvalue()
             st.success(f"Loaded {len(pdfs)} PDF file(s).")
+
+    # Show per-file cleaning reports
+    if SS["data_checks"]:
+        with st.expander("Data Quality Reports (per CSV)", expanded=False):
+            for name, rep in SS["data_checks"].items():
+                st.markdown(f"**{name}**")
+                st.json(rep)
+                st.divider()
 
     with st.expander("Map CSV Schema (click to edit)", expanded=True if SS["csv_files"] else False):
         for name, df in SS["csv_files"].items():
@@ -1037,27 +1053,6 @@ with tab_data:
             pick("Revenue (period revenue)", "revenue")
             pick("Product", "product")
             st.divider()
-
-    # Data quality reports
-    with st.expander("Data Quality Reports (auto)", expanded=True if SS["data_checks"] else False):
-        if not SS["data_checks"]:
-            st.caption("Upload CSVs to see automatic cleaning results here.")
-        else:
-            for name, rep in SS["data_checks"].items():
-                st.markdown(f"**{name}**")
-                c1,c2,c3,c4 = st.columns(4)
-                c1.metric("Rows (before)", rep.get("rows_before", 0))
-                c2.metric("Rows (after)", rep.get("rows_after", 0))
-                c3.metric("Removed (total)", rep.get("rows_removed_total", 0))
-                src = rep.get("revenue_source","none")
-                c4.metric("Revenue source", src)
-                st.write("- Dropped duplicates on keys:", rep.get("dropped_exact_duplicates_on_keys", {}).get("keys", []),
-                         "→", rep.get("dropped_exact_duplicates_on_keys", {}).get("rows", 0))
-                st.write("- Dropped missing core fields:", rep.get("dropped_missing_core_fields", 0))
-                st.write("- Dropped non-positive revenue rows:", rep.get("dropped_non_positive_revenue_rows", 0))
-                st.write("- Coerced bad dates → NaT:", rep.get("coerced_bad_dates_to_NaT", 0))
-                st.write("- Filled missing quantity to 1:", rep.get("filled_missing_quantity_to_1", 0))
-                st.divider()
 
     st.write("**Loaded CSVs:**", list(SS["csv_files"].keys()) or "—")
     st.write("**Loaded PDFs:**", list(SS["pdf_files"].keys()) or "—")
