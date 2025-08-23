@@ -239,7 +239,7 @@ MODULES = [
     "Pricing Power (CSV)",
     "NRR/GRR (CSV)",
     "Unit Economics (CSV)",
-    "PVM Bridge (CSV)",   # <— ensure present in Matrix
+    "PMV Bridge (CSV)",   # <— ensure present in Matrix
 ]
 
 QOE_TEMPLATE = [
@@ -248,7 +248,7 @@ QOE_TEMPLATE = [
     ("NRR/GRR",         "NRR/GRR (CSV)"),
     ("Pricing Power",   "Pricing Power (CSV)"),
     ("Cohort Retention","Cohort Retention (CSV)"),
-    ("PVM Bridge",      "PVM Bridge (CSV)"),
+    ("PMV Bridge",      "PMV Bridge (CSV)"),
 ]
 
 def add_rows_from_csvs():
@@ -257,7 +257,7 @@ def add_rows_from_csvs():
         if not any(r["source"] == name for r in SS["rows"]):
             rid = uid("row")
             SS["rows"].append({"id": rid, "alias": name.replace(".csv",""), "row_type":"table", "source": name})
-            # default-map ALL CSV modules, including PVM
+            # default-map ALL CSV modules, including PMV
             SS["matrix"].setdefault(rid, set([m for m in MODULES if "(CSV)" in m]))
 
 def add_rows_from_pdfs():
@@ -306,7 +306,7 @@ MODULE_COST_CENTS = {
     "Pricing Power (CSV)": 6,
     "NRR/GRR (CSV)": 8,
     "Unit Economics (CSV)": 3,
-    "PVM Bridge (CSV)": 8,
+    "PMV Bridge (CSV)": 8,
 }
 
 def module_cost(mod: str) -> int:
@@ -472,7 +472,7 @@ def _unit_econ(df: pd.DataFrame, gm: float = 0.62, cac: float = 42.0) -> Dict[st
             citations=[{"source":"csv","selector":"demo"}]
         )
 
-def _pvm_bridge(df: pd.DataFrame) -> Dict[str, Any]:
+def _pmv_bridge(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Price-Volume-Mix bridge between two periods (earliest vs latest month).
     Requires: month (or order_date), price, quantity, product (fallback 'all').
@@ -592,9 +592,9 @@ def execute_cell(row: Dict[str,Any], col: Dict[str,Any]) -> Dict[str,Any]:
         k = _unit_econ(df, gm=SS.get("whatif_gm",0.62), cac=SS.get("whatif_cac",42.0))
         return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
 
-    if mod == "PVM Bridge (CSV)":
+    if mod == "PMV Bridge (CSV)":
         df = materialize_df(row["source"])
-        k = _pvm_bridge(df)
+        k = _pmv_bridge(df)
         return {"status":"done","value":k["value"],"summary":k["summary"],"last_run": now_ts(), **k}
 
     return {"status":"error","value":None,"summary":f"Unknown module: {mod}","last_run": now_ts()}
@@ -834,9 +834,9 @@ def plot_pricing(scatter: Dict[str, Any]):
         df = pd.DataFrame({"log_p": x, "log_q": y})
         st.scatter_chart(df, x="log_p", y="log_q")
 
-def plot_pvm(bridge: List[Dict[str, Any]]):
+def plot_pmv(bridge: List[Dict[str, Any]]):
     if not bridge:
-        st.info("No PVM bridge available.")
+        st.info("No PMV bridge available.")
         return
     df = pd.DataFrame(bridge)
     if PLOTLY_OK:
@@ -1012,7 +1012,7 @@ with tab_grid:
                 "Pricing Power (CSV)": "Pricing Power (CSV)" in sel,
                 "NRR/GRR (CSV)": "NRR/GRR (CSV)" in sel,
                 "Unit Economics (CSV)": "Unit Economics (CSV)" in sel,
-                "PVM Bridge (CSV)": "PVM Bridge (CSV)" in sel,   # <— visible checkbox
+                "PMV Bridge (CSV)": "PMV Bridge (CSV)" in sel,   # <— visible checkbox
             })
         mdf = pd.DataFrame(base)
         mdf_edit = st.data_editor(
@@ -1023,7 +1023,7 @@ with tab_grid:
                 "Pricing Power (CSV)": st.column_config.CheckboxColumn(),
                 "NRR/GRR (CSV)": st.column_config.CheckboxColumn(),
                 "Unit Economics (CSV)": st.column_config.CheckboxColumn(),
-                "PVM Bridge (CSV)": st.column_config.CheckboxColumn(),
+                "PMV Bridge (CSV)": st.column_config.CheckboxColumn(),
             },
             hide_index=True, use_container_width=True, key="matrix_editor"
         )
@@ -1208,9 +1208,9 @@ with tab_review:
             elif module == "PDF KPIs (PDF)":
                 st.info("PDF KPIs module returns a narrative summary (no chart).")
 
-            elif module == "PVM Bridge (CSV)":
+            elif module == "PMV Bridge (CSV)":
                 st.markdown("**Price-Volume-Mix Bridge**")
-                plot_pvm(res.get("bridge", []))
+                plot_pmv(res.get("bridge", []))
                 periods = res.get("periods", {})
                 if periods:
                     st.caption(f"Periods: {periods.get('from','?')} → {periods.get('to','?')}")
