@@ -2,7 +2,7 @@
 # Transform AI — Diligence Grid (Pro)
 # Adds: PMV Bridge module, Approvals, Evidence drawer, Run budget, Sidebar what-ifs
 # Also: Auto data-quality checks & cleaning on CSV upload (dedupe, neg revenue, missing core fields)
-# (Structure preserved; only PMV + data checks added)
+# (Structure preserved; only PMV + data checks added; non-positive revenue drop now flag-controlled)
 
 from __future__ import annotations
 import io, json, time, uuid
@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+# ---------------- Flag: control dropping non-positive revenue rows ----------------
+# Set to True to DROP rows with non-positive revenue during auto-cleaning;
+# set to False to KEEP them.
+CLEANING_DROP_NONPOS_REVENUE = False
 
 # Optional PDF export
 try:
@@ -45,12 +50,9 @@ st.markdown(
 <style>
 .block-container {max-width: 1700px !important; padding-top: 0.5rem;}
 /* Fix header clipping + spacing */
-h1, .stMarkdown h1 {
-  white-space: normal !important;
-  overflow-wrap: anywhere !important;
-  line-height: 1.15 !important;
-  margin-top: .25rem !important;
-}
+h1, .stMarkdown h1
+{ white-space: normal !important; overflow-wrap: anywhere !important;
+  line-height: 1.15 !important; margin-top: .25rem !important; }
 .stDataFrame [role="checkbox"] {transform: scale(1.0);}
 </style>
 """,
@@ -194,9 +196,14 @@ def _auto_guess_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         "product":     pick("product","sku","item","category"),
     }
 
-def _auto_clean_csv(df: pd.DataFrame, guess: Dict[str, Optional[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Auto-detect & fix: exact duplicates, negative revenue, missing core fields, bad dates.
-       Only removes rows when we're confident (exact key duplicates, non-positive revenue, missing core)."""
+def _auto_clean_csv(
+    df: pd.DataFrame,
+    guess: Dict[str, Optional[str]],
+    drop_nonpos_revenue: bool = CLEANING_DROP_NONPOS_REVENUE
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Auto-detect & fix: exact duplicates, negative revenue (optional drop),
+       missing core fields, bad dates.
+       Only removes rows when we're confident (exact key duplicates, optional non-positive revenue, missing core)."""
     report: Dict[str, Any] = {}
     before = int(len(df))
     df2 = df.copy()
@@ -270,7 +277,7 @@ def _auto_clean_csv(df: pd.DataFrame, guess: Dict[str, Optional[str]]) -> Tuple[
             df2 = df2.loc[~mask_core].copy()
     report["dropped_missing_core_fields"] = drop_core
 
-    # Remove rows with non-positive revenue (likely refunds/voids) — conservative
+    # Non-positive revenue rows — only drop if flag is True
     dropped_nonpos_rev = 0
     wr = None
     if rev and rev in df2.columns:
@@ -281,9 +288,12 @@ def _auto_clean_csv(df: pd.DataFrame, guess: Dict[str, Optional[str]]) -> Tuple[
         wr = pd.to_numeric(df2[prc], errors="coerce") * pd.to_numeric(df2[qty], errors="coerce")
     if wr is not None:
         mask = (wr <= 0) | wr.isna()
-        dropped_nonpos_rev = int(mask.sum())
-        if dropped_nonpos_rev > 0:
-            df2 = df2.loc[~mask].copy()
+        if drop_nonpos_revenue:
+            dropped_nonpos_rev = int(mask.sum())
+            if dropped_nonpos_rev > 0:
+                df2 = df2.loc[~mask].copy()
+        else:
+            dropped_nonpos_rev = 0
     report["dropped_non_positive_revenue_rows"] = dropped_nonpos_rev
 
     report["rows_before"] = before
@@ -990,7 +1000,10 @@ with tab_data:
                 except Exception:
                     raw_df = pd.read_csv(io.BytesIO(f.getvalue()))
                 guess = _auto_guess_schema(raw_df)
-                cleaned_df, report = _auto_clean_csv(raw_df, guess)
+                cleaned_df, report = _auto_clean_csv(
+                    raw_df, guess,
+                    drop_nonpos_revenue=CLEANING_DROP_NONPOS_REVENUE
+                )
                 SS["csv_files"][f.name] = cleaned_df        # store CLEANED
                 SS["schema"].setdefault(f.name, guess)      # keep guess editable
                 SS["data_checks"][f.name] = report          # store report
@@ -1025,7 +1038,7 @@ with tab_data:
             pick("Product", "product")
             st.divider()
 
-    # New: Data quality reports
+    # Data quality reports
     with st.expander("Data Quality Reports (auto)", expanded=True if SS["data_checks"] else False):
         if not SS["data_checks"]:
             st.caption("Upload CSVs to see automatic cleaning results here.")
