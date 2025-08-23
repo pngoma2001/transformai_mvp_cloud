@@ -1110,7 +1110,7 @@ with tab_run:
     if SS["jobs"]:
         st.markdown("**Jobs**")
         st.dataframe(pd.DataFrame(SS["jobs"]), use_container_width=True, height=200)
-    if SS["results"]]:
+    if SS["results"]:
         c1, c2 = st.columns(2)
         with c1:
             if st.download_button("Export APPROVED results CSV", data=export_results_csv(only_approved=True), file_name="transformai_results.csv"):
