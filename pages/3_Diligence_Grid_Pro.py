@@ -1089,7 +1089,7 @@ with tab_run:
     if SS["jobs"]:
         st.markdown("**Jobs**")
         st.dataframe(pd.DataFrame(SS["jobs"]), use_container_width=True, height=200)
-    if SS["results"]():
+    if SS["results"]:
         pass  # retained behavior
     if SS["results"]:
         c1, c2 = st.columns(2)
